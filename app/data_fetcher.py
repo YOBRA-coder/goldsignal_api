@@ -152,20 +152,29 @@ def _fetch_direct(symbol: str, yf_interval: str, period: str) -> pd.DataFrame:
 
 def _fetch_yf_history(symbol: str, yf_interval: str, period: str) -> pd.DataFrame:
     import yfinance as yf
-    df = yf.Ticker(symbol).history(period=period, interval=yf_interval,
-                                   auto_adjust=False, actions=False, timeout=15)
-    if df is None or df.empty:
-        raise RuntimeError("empty frame")
-    return _normalize(df)
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval=yf_interval,
+                                       auto_adjust=False, actions=False, timeout=15)
+        if df is None or df.empty:
+            raise RuntimeError("empty frame")
+        return _normalize(df)
+    except Exception as e:
+        print(f"⚠️ yfinance history failed for {symbol} ({yf_interval}): {e}. Attempting cache recovery...")
+        #return _load_from_local_cache(symbol, yf_interval, period)
 
 
 def _fetch_yf_download(symbol: str, yf_interval: str, period: str) -> pd.DataFrame:
     import yfinance as yf
-    df = yf.download(symbol, period=period, interval=yf_interval, progress=False,
-                     auto_adjust=False, threads=False, timeout=15)
-    if df is None or df.empty:
-        raise RuntimeError("empty frame")
-    return _normalize(df)
+    try:
+        df = yf.download(symbol, period=period, interval=yf_interval, progress=False,
+                         auto_adjust=False, threads=False, timeout=15)
+        if df is None or df.empty:
+            raise RuntimeError("empty frame")
+        return _normalize(df)
+    except Exception as e:
+        print(f"⚠️ yfinance download failed for {symbol} ({yf_interval}): {e}. Attempting cache recovery...")
+        #return _load_from_local_cache(symbol, yf_interval, period)
+    
 
 
 # yfinance impersonates a browser (curl_cffi) and copes with Yahoo's cookie/crumb -> preferred.
