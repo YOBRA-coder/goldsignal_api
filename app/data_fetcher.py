@@ -160,7 +160,7 @@ def _fetch_yf_history(symbol: str, yf_interval: str, period: str) -> pd.DataFram
         return _normalize(df)
     except Exception as e:
         print(f"⚠️ yfinance history failed for {symbol} ({yf_interval}): {e}. Attempting cache recovery...")
-        #return _load_from_local_cache(symbol, yf_interval, period)
+        return _load_from_local_cache(symbol, yf_interval, period)
 
 
 def _fetch_yf_download(symbol: str, yf_interval: str, period: str) -> pd.DataFrame:
@@ -173,9 +173,27 @@ def _fetch_yf_download(symbol: str, yf_interval: str, period: str) -> pd.DataFra
         return _normalize(df)
     except Exception as e:
         print(f"⚠️ yfinance download failed for {symbol} ({yf_interval}): {e}. Attempting cache recovery...")
-        #return _load_from_local_cache(symbol, yf_interval, period)
+        return _load_from_local_cache(symbol, yf_interval, period)
     
 
+def _load_from_local_cache(symbol: str, yf_interval: str, period: str) -> pd.DataFrame:
+    """Helper fallback to load CSV cache files if Yahoo Finance blocks the server IP"""
+    # Clean symbol name for filename matching (e.g., EURUSD=X to EURUSDX)
+    clean_symbol = symbol.replace("=", "")
+    cache_filename = f"cache/{clean_symbol}_{yf_interval}_{period}.csv"
+    
+    if os.path.exists(cache_filename):
+        try:
+            df = pd.read_csv(cache_filename, index_col=0, parse_dates=True)
+            if not df.empty:
+                print(f"✅ Successfully recovered data from local cache: {cache_filename}")
+                return df
+        except Exception as cache_err:
+            print(f"❌ Failed reading cache file {cache_filename}: {cache_err}")
+            
+    # Absolute emergency fallback: Return an empty DataFrame with expected column structural types so code downstream doesn't break
+    print(f"🚨 No usable local cache found for {cache_filename}. Returning empty structural frame.")
+    return pd.DataFrame(columns=['Open', 'High', 'Low', 'Close', 'Volume'])
 
 # yfinance impersonates a browser (curl_cffi) and copes with Yahoo's cookie/crumb -> preferred.
 # The raw "direct" call is a fallback: from many networks Yahoo answers it with HTTP 429.
