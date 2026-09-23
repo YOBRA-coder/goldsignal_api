@@ -372,26 +372,42 @@ def trendlines(b: Bars, swings: list[dict]) -> list[dict]:
 
 
 # ------------------------------------------------------- lower-timeframe triggers
+def _pattern_from_ohlc(po: float, pc: float, o: float, h: float, l: float, c: float, atr: float,
+                       d: int) -> dict | None:
+    """Bullish/bearish engulfing or rejection wick from raw OHLC (prev O/C + current O/H/L/C).
+    Shared by candle_pattern (closed bars) and the still-forming-candle preview so both use the exact
+    same, single definition of 'a valid trigger'.
+
+    Thresholds were tightened from the original release (0.8x body / 0.45 wick-ratio / 0.4x ATR):
+    those let a lot of mediocre, low-conviction candles count as a trigger, which is exactly what
+    'the trigger isn't picky enough' means in practice - a full engulf, a more decisive wick, and a
+    larger minimum range (relative to that timeframe's OWN ATR, so this scales fine across 5m/15m/30m)
+    all cut the number of setups but should raise the quality of the ones that still qualify."""
+    body, rng = abs(c - o), max(h - l, 1e-12)
+    upper, lower = h - max(o, c), min(o, c) - l
+    if rng < 0.5 * atr:
+        return None
+    if d == BULL:
+        if c > o and pc < po and c >= po and o <= pc and body >= 1.0 * abs(pc - po):
+            return {"type": "bullish_engulfing", "label": "Bullish engulfing", "idx": None}
+        if lower >= 1.6 * body and lower / rng >= 0.55 and c >= l + 0.62 * rng:
+            return {"type": "bullish_rejection", "label": "Bullish rejection wick", "idx": None}
+    else:
+        if c < o and pc > po and c <= po and o >= pc and body >= 1.0 * abs(pc - po):
+            return {"type": "bearish_engulfing", "label": "Bearish engulfing", "idx": None}
+        if upper >= 1.6 * body and upper / rng >= 0.55 and c <= h - 0.62 * rng:
+            return {"type": "bearish_rejection", "label": "Bearish rejection wick", "idx": None}
+    return None
+
+
 def candle_pattern(b: Bars, i: int, d: int) -> dict | None:
     """Bullish/bearish engulfing or rejection wick on closed candle i."""
     if i < 1 or d == 0:
         return None
-    o, h, l, c = b.o[i], b.h[i], b.l[i], b.c[i]
-    po, pc = b.o[i - 1], b.c[i - 1]
-    body, rng = abs(c - o), max(h - l, 1e-12)
-    upper, lower = h - max(o, c), min(o, c) - l
-    atr = b.atr[i]
-    if d == BULL:
-        if c > o and pc < po and c >= po and o <= pc and body >= 0.8 * abs(pc - po) and rng >= 0.4 * atr:
-            return {"type": "bullish_engulfing", "label": "Bullish engulfing", "idx": i}
-        if lower >= 1.5 * body and lower / rng >= 0.45 and c >= l + 0.55 * rng and rng >= 0.4 * atr:
-            return {"type": "bullish_rejection", "label": "Bullish rejection wick", "idx": i}
-    else:
-        if c < o and pc > po and c <= po and o >= pc and body >= 0.8 * abs(pc - po) and rng >= 0.4 * atr:
-            return {"type": "bearish_engulfing", "label": "Bearish engulfing", "idx": i}
-        if upper >= 1.5 * body and upper / rng >= 0.45 and c <= h - 0.55 * rng and rng >= 0.4 * atr:
-            return {"type": "bearish_rejection", "label": "Bearish rejection wick", "idx": i}
-    return None
+    pat = _pattern_from_ohlc(b.o[i - 1], b.c[i - 1], b.o[i], b.h[i], b.l[i], b.c[i], b.atr[i], d)
+    if pat is not None:
+        pat["idx"] = i
+    return pat
 
 
 def mini_bos(b: Bars, i: int, d: int, window: int = 30, recent: int = 3) -> dict | None:

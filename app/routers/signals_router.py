@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from .. import auth, models, schemas, sessions
 from .. import strategy as strat
+from ..strategy import effective_min_agreement
 from ..data_fetcher import (DataUnavailable, INTERVAL_SECONDS, data_status, drop_incomplete, get_candles,
                             is_futures)
 from ..database import get_db
@@ -87,6 +88,31 @@ def resolve_open(db: Session, user: models.User) -> list[models.SignalRecord]:
     return closed
 
 
+def check_bias_shift(db: Session, user: models.User, symbol: str, bias_4h: str, bias_1h: str) -> None:
+    """Early-warning alert: fires the moment 4H flips, or 1H moves in/out of agreement with 4H -
+    well before the full 4-step checklist would produce a BUY/SELL signal."""
+    st = db.query(models.BiasState).filter(models.BiasState.user_id == user.id,
+                                           models.BiasState.symbol == symbol).first()
+    aligned = bias_4h == bias_1h and bias_4h != "neutral"
+    if st is None:
+        db.add(models.BiasState(user_id=user.id, symbol=symbol, bias_4h=bias_4h, bias_1h=bias_1h, aligned=aligned))
+        db.commit()
+        return
+    msgs = []
+    if st.bias_4h and st.bias_4h != bias_4h and bias_4h != "neutral" and st.bias_4h != "neutral":
+        msgs.append(f"4H flipped {st.bias_4h} -> {bias_4h.upper()}")
+    elif st.bias_4h and st.bias_4h != bias_4h:
+        msgs.append(f"4H structure turned {bias_4h}")
+    if st.aligned != aligned:
+        msgs.append(f"1H {'now aligns with' if aligned else 'no longer aligns with'} 4H ({bias_1h})" if aligned
+                    else f"1H drifted out of sync with 4H (now {bias_1h} vs {bias_4h})")
+    if msgs:
+        db.add(models.Alert(user_id=user.id, kind="shift", symbol=symbol,
+                            title=f"Bias shift - {symbol}", message=" · ".join(msgs)))
+    st.bias_4h, st.bias_1h, st.aligned, st.updated_at = bias_4h, bias_1h, aligned, utcnow()
+    db.commit()
+
+
 def _live_r(rec: models.SignalRecord, price: float) -> float | None:
     if not (rec.entry_price and rec.stop_loss):
         return None
@@ -99,10 +125,11 @@ def _live_r(rec: models.SignalRecord, price: float) -> float | None:
 @router.get("/live")
 def live_signal(
     symbol: str = "GC=F",
-    entry_interval: Literal["5m", "15m", "30m"] = "15m",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
     min_agreement: float = Query(70, ge=0, le=100),
     sessions_only: bool = True,
     rr: float = Query(2.0, ge=0.5, le=10),
+    breakeven_at_r: float = Query(1.0, ge=0, le=5),
     persist: bool = True,
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
@@ -119,6 +146,12 @@ def live_signal(
         raise HTTPException(503, detail={"message": f"Not enough history for {symbol} "
                                          f"(4H {len(d4)}, 1H {len(d1)}, {entry_interval} {len(de)} bars)."})
 
+    forming_bar = None
+    if len(rawe) > len(de):
+        r = rawe.iloc[-1]
+        forming_bar = {"Open": float(r["Open"]), "High": float(r["High"]), "Low": float(r["Low"]),
+                       "Close": float(r["Close"])}
+
     daily = weekly = None
     try:
         daily, weekly = get_candles(symbol, "1d"), get_candles(symbol, "1w")
@@ -130,15 +163,42 @@ def live_signal(
     futures = is_futures(symbol)
     status = data_status(symbol, entry_interval, rawe)
     market_ok = status["market_open"] and not status["stale"]
-    cfg = strat.Cfg(rr=rr, min_agreement=min_agreement, sessions_only=sessions_only,
-                    entry_seconds=INTERVAL_SECONDS[entry_interval], entry_interval=entry_interval)
-    sig, analysis = strat.build_signal(d4, d1, de, cfg, levels, sessions.allowed_mask(de.index), market_ok)
+    eff_min = effective_min_agreement(min_agreement, rr, INTERVAL_SECONDS[entry_interval])
+    cfg = strat.Cfg(rr=rr, min_agreement=eff_min, sessions_only=sessions_only,
+                    entry_seconds=INTERVAL_SECONDS[entry_interval], entry_interval=entry_interval,
+                    breakeven_at_r=breakeven_at_r)
+    sig, analysis = strat.build_signal(d4, d1, de, cfg, levels, sessions.allowed_mask(de.index), market_ok,
+                                       forming_bar=forming_bar)
+    sig["min_agreement_requested"] = min_agreement
+    sig["min_agreement_effective"] = round(eff_min, 1)
     if not market_ok:
         lag_min = round((status.get("lag_sec") or 0) / 60)
         sig["headline"] = (f"Price feed is ~{lag_min} min behind - signals paused until it catches up"
                            if status["market_open"] else "Market closed - no signals until it reopens")
     sess = sessions.session_state(futures=futures)
     sig["session"] = {"label": sess["label"], "active": sess["active"], "allowed": sess["trade_allowed"]}
+
+    # ---- early-warning: did the 4H/1H bias itself shift? (independent of whether a full signal fired)
+    if market_ok:
+        try:
+            check_bias_shift(db, user, symbol, sig["bias_4h"], sig["bias_1h"])
+        except Exception:  # noqa: BLE001 - never let an alert-side bug break the live endpoint
+            db.rollback()
+
+    # ---- scan log: record every evaluation (fired or not) so a quiet day is explainable, not opaque
+    db.add(models.ScanLog(
+        user_id=user.id, symbol=symbol, entry_interval=entry_interval, status=sig["status"],
+        headline=sig["headline"], direction=sig["direction"] if sig["direction"] in ("BUY", "SELL") else None,
+        bias_4h=sig["bias_4h"], bias_1h=sig["bias_1h"], agreement=sig["agreement"]))
+    stale = db.query(models.ScanLog.id).filter(
+        models.ScanLog.user_id == user.id, models.ScanLog.symbol == symbol,
+        models.ScanLog.entry_interval == entry_interval).order_by(desc(models.ScanLog.ts)).offset(500).all()
+    if stale:
+        db.query(models.ScanLog).filter(models.ScanLog.id.in_([s.id for s in stale])).delete(synchronize_session=False)
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001 - the scan log is diagnostic only, never block the live endpoint on it
+        db.rollback()
 
     # ---- resolve old signals (win/loss alerts) then persist a fresh one
     newly_closed = resolve_open(db, user)
@@ -186,6 +246,26 @@ def live_signal(
         "data": status,
         "updated_at": int(datetime.now(timezone.utc).timestamp()),
     }
+
+
+# ---------------------------------------------------------------------- scan log
+@router.get("/scan-log")
+def scan_log(
+    symbol: str = "GC=F",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Every evaluation the engine made (fired or not), newest first - the answer to 'what's it been
+    doing all day' and 'why hasn't this pair signalled yet'."""
+    q = db.query(models.ScanLog).filter(models.ScanLog.user_id == user.id, models.ScanLog.symbol == symbol)
+    if entry_interval:
+        q = q.filter(models.ScanLog.entry_interval == entry_interval)
+    rows = q.order_by(desc(models.ScanLog.ts)).limit(limit).all()
+    return [{"ts": int(r.ts.replace(tzinfo=timezone.utc).timestamp()), "entry_interval": r.entry_interval,
+            "status": r.status, "headline": r.headline, "direction": r.direction,
+            "bias_4h": r.bias_4h, "bias_1h": r.bias_1h, "agreement": r.agreement} for r in rows]
 
 
 # ---------------------------------------------------------------------- history

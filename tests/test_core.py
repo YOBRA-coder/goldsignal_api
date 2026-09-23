@@ -102,3 +102,33 @@ def test_own_structure_for_every_timeframe():
         df = f.drop_incomplete(f.get_candles("GC=F", tf), tf)
         st = S.own_structure(df, tf)
         assert st is None or st["bias"] in ("bullish", "bearish", "neutral")
+
+
+def test_candles_are_cut_like_metatrader5():
+    """ny_close anchor: server = New York + 7h  ->  4H candles start 17,21,01,05,09,13 NY time,
+    D1 starts 17:00 NY; utc anchor -> 00,04,08... UTC."""
+    from app import settings
+    idx = pd.date_range("2026-07-06 00:00", "2026-07-10 20:00", freq="1h", tz="UTC")     # summer (EDT)
+    df = pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5, "Volume": 1.0}, index=idx)
+    settings.set_anchor("ny_close")
+    h4 = f.resample_ohlc(df, "4h")
+    assert set(h4.index.hour) == {21, 1, 5, 9, 13, 17}          # UTC hours in summer == NY 17,21,01,05,09,13
+    d1 = f.resample_ohlc(df, "1d")
+    assert set(d1.index.hour) == {21}                            # day opens 17:00 EDT = 21:00 UTC
+    w1 = f.resample_ohlc(df, "1w")
+    assert w1.index[0].weekday() in (6, 0) and w1.index[0].hour == 21
+    settings.set_anchor("utc")
+    assert set(f.resample_ohlc(df, "4h").index.hour) == {0, 4, 8, 12, 16, 20}
+    assert set(f.resample_ohlc(df, "1d").index.hour) == {0}
+    settings.set_anchor("ny_close")
+
+
+def test_price_offset_shifts_every_timeframe():
+    from app import settings
+    base = f.get_candles("GC=F", "15m")["Close"].iloc[-1]
+    settings.set_offset("GC=F", 12.5)
+    try:
+        assert abs(f.get_candles("GC=F", "15m")["Close"].iloc[-1] - base - 12.5) < 1e-6
+        assert abs(f.get_candles("GC=F", "4h")["High"].iloc[-1] - f.resample_ohlc(f._candles("GC=F", "1h", None, True), "4h")["High"].iloc[-1] - 12.5) < 1e-6
+    finally:
+        settings.set_offset("GC=F", None)

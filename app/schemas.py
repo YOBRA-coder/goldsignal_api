@@ -117,10 +117,11 @@ class ProfileStats(BaseModel):
 class BacktestRequest(BaseModel):
     symbol: str = "GC=F"
     period: str = "59d"           # Yahoo only serves ~60 days of 5m/15m history
-    entry_interval: Literal["5m", "15m", "30m"] = "15m"
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m"
     risk_reward: float = 2.0
     min_agreement: float = 70.0
     sessions_only: bool = True
+    breakeven_at_r: float = 1.0   # move stop to entry after this many R in favor; 0 disables it
 
 
 class BacktestOut(BaseModel):

@@ -36,6 +36,8 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import requests
 
+from . import settings
+
 log = logging.getLogger("goldsignal.data")
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache")
@@ -45,7 +47,7 @@ DEMO = os.environ.get("GOLDSIGNAL_DEMO", "").lower() in ("1", "true", "yes")
 
 # public timeframe -> Yahoo interval
 YF_INTERVAL = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-               "1h": "1h", "4h": "1h", "1d": "1d", "1w": "1wk"}
+               "1h": "1h", "4h": "1h", "1d": "1h", "1w": "1h"}  # 4h/1d/1w are cut from 1h (broker-aligned)
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800,
                     "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 SUPPORTED = list(INTERVAL_SECONDS)
@@ -53,7 +55,7 @@ SUPPORTED = list(INTERVAL_SECONDS)
 # 1m is the "live tape": every other timeframe is patched with it (see merge_live), so the
 # slower frames can be cached longer without the newest candle ever lagging.
 DEFAULT_PERIOD = {"1m": "2d", "5m": "30d", "15m": "30d", "30m": "45d",
-                  "1h": "180d", "1d": "2y", "1wk": "5y"}
+                  "1h": "365d", "1d": "2y", "1wk": "5y"}
 TTL = {"1m": 12, "5m": 90, "15m": 120, "30m": 180, "1h": 300, "1d": 120, "1wk": 600}
 FAIL_COOLDOWN = 25  # seconds before retrying a failed download
 
@@ -172,7 +174,7 @@ METHODS = (("yfinance.history", _fetch_yf_history), ("direct", _fetch_direct),
            ("yfinance.download", _fetch_yf_download))
 
 _method_block: dict[str, float] = {}      # method -> unix time until which we skip it
-_gate = threading.Semaphore(3)            # max 3 simultaneous Yahoo requests
+_gate = threading.Semaphore(1)            # one Yahoo request at a time (yfinance/curl_cffi is not thread-safe)
 _last_call = [0.0]
 _call_lock = threading.Lock()
 BLOCK_SECONDS = 120
@@ -294,23 +296,54 @@ def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.Dat
 
 # ------------------------------------------------------------------- public API
 def resample_ohlc(df: pd.DataFrame, rule: str, symbol: str = "GC=F") -> pd.DataFrame:
-    """Resample to 4h bars anchored on the FX/futures trading-day roll
-    (18:00 ET for futures, 17:00 ET for spot FX) like TradingView does."""
-    anchor_h = 18 if is_futures(symbol) else 17
-    ny = df.tz_convert("America/New_York")
-    out = (
-        ny.resample(rule, origin="start_day", offset=f"{anchor_h % 4}h")
-        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-        .dropna(subset=["Open", "Close"])
-    )
-    out.index = out.index.tz_convert("UTC")
+    """Cut 4h / 1d / 1w candles the way MetaTrader 5 does (see settings.py):
+    ny_close -> broker server time = New York time + 7 h (GMT+2 winter / GMT+3 summer, DST follows the US),
+                so the trading day starts at 17:00 New York and 4H candles start 17,21,01,05,09,13 NY time
+    utc      -> candles cut on UTC boundaries"""
+    if df.empty:
+        return df
+    idx = df.index
+    utc_naive = idx.tz_convert("UTC").tz_localize(None)
+    if settings.anchor() == "ny_close":
+        et = idx.tz_convert("America/New_York").tz_localize(None)
+        off = et - utc_naive                       # negative: NY is behind UTC
+        shift = pd.Timedelta(hours=7)
+        srv = et + shift
+    else:
+        off = utc_naive - utc_naive                # zero timedeltas
+        shift = pd.Timedelta(0)
+        srv = utc_naive
+    if rule == "4h":
+        key = srv.floor("4h")
+    elif rule == "1d":
+        key = srv.floor("D")
+    elif rule == "1w":
+        d = srv.floor("D")
+        key = d - pd.to_timedelta(d.dayofweek, unit="D")   # week starts Monday 00:00 server time
+    else:
+        raise ValueError(rule)
+    tmp = df.reset_index(drop=True).assign(_k=key, _off=off)
+    g = tmp.groupby("_k")
+    out = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
+                        "Close": g["Close"].last(), "Volume": g["Volume"].sum(), "_off": g["_off"].first()})
+    start = out.index.to_series() - shift - out["_off"]     # back to naive UTC
+    out = out.drop(columns="_off")
+    out.index = pd.DatetimeIndex(start.to_numpy()).tz_localize("UTC")
     out.index.name = "time"
     return out
 
 
 def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
     """Patch a (cached, possibly minutes-old) frame with the live 1-minute tape so the newest
-    candle of EVERY timeframe keeps moving, and brand-new candles appear the moment they open."""
+    candle of EVERY timeframe keeps moving, and brand-new candles appear the moment they open.
+
+    Only the TAIL is touched (the last cached bar plus whatever the 1m tape covers since then) and
+    every rebuilt bar is cut on an EPOCH-aligned boundary (floor(unix_time / step) * step) - the same
+    grid Yahoo's own 5m/15m/30m/1h bars sit on. Bucketing relative to "the last cached bar's start"
+    instead of the epoch was the bug that made 1m/5m candles look slightly misaligned / jump on refresh:
+    if the cached base bar wasn't itself sitting exactly on a round boundary, every synthetic bar drifted
+    with it and snapped back the moment a fresh native fetch replaced the cache.
+    """
     if interval == "1m" or base.empty:
         return base
     try:
@@ -322,43 +355,57 @@ def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
     step = INTERVAL_SECONDS[interval]
     df = base.copy()
     last_start = df.index[-1]
-    last_end = last_start + timedelta(seconds=step)
-    intraday = interval in ("5m", "15m", "30m", "1h", "4h")
-    seg = m1[(m1.index >= last_start) & ((m1.index < last_end) if intraday else True)]
-    if len(seg):
-        j = df.index[-1]
-        df.loc[j, "High"] = max(df.loc[j, "High"], seg["High"].max())
-        df.loc[j, "Low"] = min(df.loc[j, "Low"], seg["Low"].min())
-        df.loc[j, "Close"] = seg["Close"].iloc[-1]
-        df.loc[j, "Volume"] = max(df.loc[j, "Volume"], seg["Volume"].sum())
-    if intraday:
-        rest = m1[m1.index >= last_end]
-        if len(rest):
-            t0 = int(last_start.timestamp())
-            secs = rest.index.as_unit("s").asi8
-            k = (secs - t0) // step
-            g = rest.assign(_k=k).groupby("_k")
-            new = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
-                                "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
-            new.index = pd.DatetimeIndex([last_start + timedelta(seconds=int(i) * step) for i in new.index], tz="UTC")
-            new.index.name = "time"
-            df = pd.concat([df, new])
+    # Only rebuild from one bar back (safety margin in case the cached last bar was itself partial) -
+    # never touches older history, so this stays cheap even with a 2-day 1m tape.
+    window_start = last_start - timedelta(seconds=step)
+    seg = m1[m1.index >= window_start]
+    if seg.empty:
+        return df
+
+    secs = seg.index.as_unit("s").asi8
+    bucket = (secs // step) * step
+    g = seg.assign(_k=bucket).groupby("_k")
+    new_bars = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
+                             "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
+    new_bars.index = pd.to_datetime(new_bars.index, unit="s", utc=True)
+    new_bars.index.name = "time"
+    if new_bars.empty:
+        return df
+
+    cutoff = new_bars.index.min()
+    df = pd.concat([df[df.index < cutoff], new_bars]).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
     return df
+
+
+def _candles(symbol: str, interval: str, period: str | None, live: bool) -> pd.DataFrame:
+    if interval in ("4h", "1d", "1w"):
+        base = _candles(symbol, "1h", period, live)
+        return resample_ohlc(base, interval, symbol)
+    df = _get_raw(symbol, YF_INTERVAL[interval], period)
+    return merge_live(df, interval, symbol) if live else df
 
 
 def get_candles(symbol: str, interval: str = "15m", period: str | None = None, live: bool = True) -> pd.DataFrame:
     """OHLCV DataFrame (UTC index, columns Open High Low Close Volume).
     Includes the still-forming last bar; use drop_incomplete() for analysis.
-    live=True patches the newest bar(s) with the 1-minute feed (ignored when a custom period is asked for)."""
+    live=True patches the newest bar(s) with the 1-minute feed (ignored when a custom period is asked for).
+    4h/1d/1w are cut from 1h candles on MT5-style boundaries and every price gets the calibration offset."""
     check_symbol(symbol)
     if interval not in INTERVAL_SECONDS:
         raise DataUnavailable(f"Unsupported timeframe '{interval}'")
-    live = live and period is None
-    if interval == "4h":
-        base = get_candles(symbol, "1h", period, live)
-        return resample_ohlc(base, "4h", symbol)
-    df = _get_raw(symbol, YF_INTERVAL[interval], period)
-    return merge_live(df, interval, symbol) if live else df
+    df = _candles(symbol, interval, period, live and period is None)
+    off = settings.offset(symbol)
+    if off:
+        df = df.copy()
+        df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]] + off
+    return df
+
+
+def raw_last_price(symbol: str) -> float:
+    """Latest Yahoo price WITHOUT the calibration offset (used to calibrate)."""
+    m1 = _get_raw(symbol, "1m")
+    return float(m1["Close"].iloc[-1])
 
 
 CLOSE_GRACE = 15  # seconds after a bar's end before it counts as closed (lets the last 1m bar arrive)

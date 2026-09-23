@@ -73,6 +73,39 @@ class Alert(Base):
     created_at = Column(DateTime, default=utcnow)
 
 
+class BiasState(Base):
+    """Last known 4H/1H bias per user+symbol, so we can detect a SHIFT (early-warning alert)
+    the moment structure flips, well before all 4 steps line up into a full BUY/SELL signal."""
+    __tablename__ = "bias_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    symbol = Column(String, index=True)
+    bias_4h = Column(String, nullable=True)
+    bias_1h = Column(String, nullable=True)
+    aligned = Column(Boolean, nullable=True)     # was 1H matching 4H?
+    updated_at = Column(DateTime, default=utcnow)
+
+
+class ScanLog(Base):
+    """One row per /signals/live evaluation (fired or not) - lets 'why hasn't this pair signalled
+    today' be answered by looking at the log instead of guessing. Pruned to the most recent rows per
+    user/symbol/entry_interval so it never grows unbounded."""
+    __tablename__ = "scan_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    symbol = Column(String)
+    entry_interval = Column(String)
+    ts = Column(DateTime, default=utcnow, index=True)
+    status = Column(String)          # e.g. waiting_trigger, not_aligned, signal, ...
+    headline = Column(Text)
+    direction = Column(String, nullable=True)
+    bias_4h = Column(String, nullable=True)
+    bias_1h = Column(String, nullable=True)
+    agreement = Column(Float, nullable=True)
+
+
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
 

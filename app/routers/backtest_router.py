@@ -30,8 +30,17 @@ def run(
     user: models.User = Depends(auth.get_current_user),
 ):
     try:
-        df = get_candles(payload.symbol, payload.entry_interval, payload.period, live=False)
-        df1 = get_candles(payload.symbol, "1h", "180d", live=False)
+        period = payload.period
+        if payload.entry_interval == "1m":
+            # Yahoo only serves 1m candles for the trailing ~7 days per request
+            try:
+                days = int("".join(ch for ch in period if ch.isdigit()) or "999")
+            except ValueError:
+                days = 999
+            if days > 7 or not period.strip().endswith("d"):
+                period = "7d"
+        df = get_candles(payload.symbol, payload.entry_interval, period, live=False)
+        df1 = get_candles(payload.symbol, "1h", live=False)
     except DataUnavailable as e:
         raise HTTPException(503, detail={"message": str(e), "diagnostics": e.diagnostics})
     df = drop_incomplete(df, payload.entry_interval)
@@ -39,13 +48,14 @@ def run(
     if len(df) < 600:
         raise HTTPException(400, f"Only {len(df)} bars available - need at least 600 for a meaningful backtest.")
     result = bt.run_backtest(df, payload.entry_interval, payload.risk_reward, payload.min_agreement,
-                             payload.sessions_only, payload.symbol, df1)
+                             payload.sessions_only, payload.symbol, df1, payload.breakeven_at_r)
 
     stats = {k: result[k] for k in ("profit_factor", "max_drawdown_r", "best_streak", "worst_streak",
-                                    "by_session", "by_direction", "equity_ts", "bars", "from_ts", "to_ts", "htf_source")}
+                                    "by_session", "by_direction", "equity_ts", "bars", "from_ts", "to_ts", "htf_source",
+                                    "min_agreement_requested", "min_agreement_effective", "breakeven_at_r", "breakevens")}
     stats["params"] = payload.model_dump()
     rec = models.BacktestRun(
-        user_id=user.id, symbol=payload.symbol, period=payload.period,
+        user_id=user.id, symbol=payload.symbol, period=period,
         entry_interval=payload.entry_interval,
         total_trades=result["total_trades"], wins=result["wins"], losses=result["losses"],
         win_rate=result["win_rate"], net_r=result["net_r"], avg_r=result["avg_r"],

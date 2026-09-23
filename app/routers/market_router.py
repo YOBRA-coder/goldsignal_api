@@ -6,9 +6,11 @@ from typing import Literal
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import auth, models, sessions
+from pydantic import BaseModel
+
+from .. import auth, models, sessions, settings
 from ..data_fetcher import (DataUnavailable, INTERVAL_SECONDS, LAST_DIAGNOSTICS, data_status, drop_incomplete,
-                            feed_health, get_candles, is_futures)
+                            feed_health, get_candles, is_futures, raw_last_price)
 from ..levels import key_levels
 from ..strategy import own_structure, quick_bias
 from ..structure import atr_array
@@ -86,7 +88,7 @@ def quote(symbol: str = "GC=F", user: models.User = Depends(auth.get_current_use
 
 
 @router.get("/watchlist")
-def watchlist(symbols: str = "GC=F,XAUUSD=X,SI=F,EURUSD=X,GBPUSD=X,USDJPY=X", user: models.User = Depends(auth.get_current_user)):
+def watchlist(symbols: str = "GC=F,XAUUSD=X,SI=F,EURUSD=X,GBPUSD=X,USDJPY=X,EURAUD=X", user: models.User = Depends(auth.get_current_user)):
     syms = [s.strip() for s in symbols.split(",") if s.strip()][:12]
 
     def one(s):
@@ -148,3 +150,54 @@ def sessions_now(symbol: str = "GC=F"):
 def health(symbol: str = "GC=F"):
     """No login needed: live test of every data-download method (helps debug the feed)."""
     return {**feed_health(symbol), "last_result": LAST_DIAGNOSTICS}
+
+
+# ------------------------------------------------------------ match MetaTrader 5
+def _mt5_state(symbol: str) -> dict:
+    st = settings.get()
+    try:
+        raw = raw_last_price(symbol)
+    except DataUnavailable:
+        raw = None
+    off = st["offsets"].get(symbol, 0.0)
+    return {"symbol": symbol, "anchor": st["anchor"], "offset": off, "offset_set_at": st["offset_set_at"].get(symbol),
+            "yahoo_price": raw, "adjusted_price": (raw + off) if raw is not None else None,
+            "all_offsets": st["offsets"]}
+
+
+@router.get("/settings")
+def get_settings(symbol: str = "GC=F", user: models.User = Depends(auth.get_current_user)):
+    return _mt5_state(symbol)
+
+
+class AnchorBody(BaseModel):
+    anchor: Literal["ny_close", "utc"]
+
+
+@router.post("/anchor")
+def set_anchor(body: AnchorBody, symbol: str = "GC=F", user: models.User = Depends(auth.get_current_user)):
+    settings.set_anchor(body.anchor)
+    return _mt5_state(symbol)
+
+
+class CalibrateBody(BaseModel):
+    symbol: str
+    mt5_price: float | None = None   # your MT5 bid/ask right now; None or 0 = reset the offset
+
+
+@router.post("/calibrate")
+def calibrate(body: CalibrateBody, user: models.User = Depends(auth.get_current_user)):
+    """Shift every candle of `symbol` so the live price equals the price in your MT5 terminal right now."""
+    import time
+    if not body.mt5_price:
+        settings.set_offset(body.symbol, None)
+        return _mt5_state(body.symbol)
+    try:
+        raw = raw_last_price(body.symbol)
+    except DataUnavailable as e:
+        raise _503(e)
+    off = body.mt5_price - raw
+    if abs(off) > 0.25 * raw:
+        raise HTTPException(400, f"That price ({body.mt5_price}) is too far from the feed ({raw:.2f}) - check the symbol.")
+    settings.set_offset(body.symbol, round(off, 5), int(time.time()))
+    return _mt5_state(body.symbol)
