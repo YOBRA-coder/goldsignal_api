@@ -90,7 +90,12 @@ class BiasState(Base):
 class ScanLog(Base):
     """One row per /signals/live evaluation (fired or not) - lets 'why hasn't this pair signalled
     today' be answered by looking at the log instead of guessing. Pruned to the most recent rows per
-    user/symbol/entry_interval so it never grows unbounded."""
+    user/symbol/entry_interval so it never grows unbounded.
+
+    checks_json / previews_json store the FULL per-check breakdown and every preview object the engine
+    produced for that scan (forming / h1_preview / one_h_preview / entry_shift_preview / counter_watch)
+    - not just the one-line headline - so the log is a real audit trail of what the engine saw and why,
+    not a compressed summary the user has to take on faith."""
     __tablename__ = "scan_logs"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -104,6 +109,13 @@ class ScanLog(Base):
     bias_4h = Column(String, nullable=True)
     bias_1h = Column(String, nullable=True)
     agreement = Column(Float, nullable=True)
+
+    # --- added in v3 (auto-migrated): full transparency log ---
+    grade = Column(String, nullable=True)
+    momentum_agree = Column(Boolean, nullable=True)
+    volatility_spike = Column(Boolean, nullable=True)
+    checks_json = Column(Text, nullable=True)
+    previews_json = Column(Text, nullable=True)
 
 
 class BacktestRun(Base):

@@ -14,6 +14,7 @@ fires only when every gate passes AND the weighted agreement >= min_agreement.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -193,6 +194,69 @@ def tf_json(ctx, price: float, name: str) -> dict:
     return out
 
 
+# ---------------------------------------------------------------- shared scan (zone + trigger only)
+def _entry_scan(zone_ctx, be: Bars, i: int, d: int, cfg: "Cfg", price: float, t: int, tap_lookback: int = 5) -> dict:
+    """Zone-tap + trigger-candle scan for direction `d` against `zone_ctx`'s OB/FVG zones (usually the
+    1H context), independent of which higher-timeframe bias is currently "official". This is what
+    lets a preview be built for a direction OTHER than the live h4.trend (e.g. 1H's own bias while 4H
+    hasn't confirmed it, or the opposite side while we're waiting on the main trigger) without
+    duplicating the whole evaluate_entry rule-set. Never used to fire a trade by itself."""
+    want = "demand" if d == BULL else "supply"
+    cands = []
+    for z in zone_ctx.zones + zone_ctx.fvgs:
+        if z["type"] == want and z["state"] != "broken" and z["formed_idx"] >= zone_ctx.b.n - 220 \
+                and zone_ctx.b.t[min(z["formed_idx"], zone_ctx.b.n - 1)] <= t:
+            cands.append(z)
+    tapped, tap_idx = None, None
+    lo_i = max(0, i - _tf_scale(cfg.entry_seconds, tap_lookback))
+    for z in sorted(cands, key=lambda q: (0 if q["source"] == "OB" else 1, -q["strength"])):
+        if d == BULL:
+            hit = (be.l[lo_i:i + 1] <= z["top"]) & (be.h[lo_i:i + 1] >= z["bottom"])
+            valid = be.c[i] >= z["bottom"]
+        else:
+            hit = (be.h[lo_i:i + 1] >= z["bottom"]) & (be.l[lo_i:i + 1] <= z["top"])
+            valid = be.c[i] <= z["top"]
+        if hit.any() and valid:
+            tapped, tap_idx = z, lo_i + int(np.argmax(hit))
+            break
+    zone_ok = tapped is not None
+    pattern = candle_pattern(be, i, d)
+    pat_ok = pattern is not None and zone_ok
+    bos = mini_bos(be, i, d, window=_tf_scale(cfg.entry_seconds, 30), recent=_tf_scale(cfg.entry_seconds, 3)) \
+        if zone_ok else None
+    vs = volume_spike(be, i, lookback=_tf_scale(cfg.entry_seconds, 20))
+    return {"cands": cands, "tapped": tapped, "tap_idx": tap_idx, "zone_ok": zone_ok,
+            "pattern": pattern, "pat_ok": pat_ok, "bos": bos, "vs": vs}
+
+
+def _momentum(be: Bars, i: int, d: int, lookback: int = 10) -> dict | None:
+    """Simple directional momentum: price change over `lookback` closed bars, normalised by ATR, must
+    agree with direction `d`. Catches the case a pattern + zone tap technically qualify but price is
+    actually dead/chopping - and, used against the OPPOSITE direction, is the earliest possible
+    heads-up that a market shift or spike is underway before any zone/pattern logic even reacts."""
+    lo = i - lookback
+    if lo < 0:
+        return None
+    atr = float(be.atr[i]) or 1e-9
+    ratio = float(be.c[i] - be.c[lo]) / atr
+    agree = (ratio > 0.15) if d == BULL else (ratio < -0.15)
+    return {"roc_atr": ratio, "agree": agree}
+
+
+def _volatility_regime(be: Bars, i: int, lookback: int = 50) -> dict | None:
+    """Current entry-tf ATR vs its own rolling baseline. Flags a SPIKE (news, session open, a sudden
+    momentum thrust) so the grade/agreement and the risk model can treat an erratic range differently
+    from an ordinary one instead of scoring every candle as if conditions were unchanged."""
+    lo = max(0, i - lookback)
+    if i - lo < 20:
+        return None
+    baseline = float(np.mean(be.atr[lo:i]))
+    if baseline <= 0:
+        return None
+    ratio = float(be.atr[i]) / baseline
+    return {"ratio": ratio, "spike": ratio >= 1.8, "quiet": ratio <= 0.6}
+
+
 # ---------------------------------------------------------------- entry evaluation
 def _add(checks: list, key, label, step, ok, detail, weight, gate=False, tf=None):
     checks.append({"key": key, "label": label, "step": step, "tf": tf, "ok": ok, "detail": detail,
@@ -328,6 +392,23 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     _add(checks, "session", "London / New York session", 4, sess_pass if sess_gate else (sess_pass or None),
          "London/NY session active" if sess_pass else "Outside London/New York - no entries", 1.5, sess_gate, tf_e)
 
+    # ---- momentum + volatility regime: two checks the original release had no read on at all, which
+    # is exactly what let a technically-qualifying but dead/choppy candle count the same as a decisive
+    # one, and let a news-spike range get graded like an ordinary one. Both non-gating (soft) - they
+    # move the agreement score and the grade, and the volatility read also feeds the risk model below.
+    mom = _momentum(be, i, d) if bias_ok else None
+    _add(checks, "momentum", f"{tf_e} momentum agrees with direction", 4, (mom["agree"] if mom else None),
+         (f"{'Upside' if d == BULL else 'Downside'} push confirms it - {abs(mom['roc_atr']):.2f}x ATR over the last bars"
+          if mom and mom["agree"] else f"Momentum stalling / against direction ({mom['roc_atr']:.2f}x ATR)" if mom
+          else "Not enough bars for a momentum read"), 1.5, False, tf_e)
+
+    volr = _volatility_regime(be, i)
+    _add(checks, "volatility", f"{tf_e} volatility is tradeable (no extreme spike)", 4,
+         (not volr["spike"] if volr else None),
+         (f"Volatility spike - range is {volr['ratio']:.1f}x the normal {tf_e} range, stop widened for it"
+          if volr and volr["spike"] else f"Range is normal ({volr['ratio']:.1f}x baseline)" if volr
+          else "Not enough bars for a volatility read"), 1.0, False, tf_e)
+
     # ---- risk model (needs zone + pattern)
     entry = sl = tp = risk = None
     risk_ok = False
@@ -338,6 +419,12 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         # play out. Widen the buffer/floor for faster entry timeframes; 15m/30m are unchanged.
         fast_tf = cfg.entry_seconds < _REF_SECONDS
         pad_mult, floor_mult = (0.4, 1.0) if fast_tf else (0.25, 0.6)
+        if volr and volr["spike"]:
+            # A blown-out range needs more room, or ordinary post-spike noise stops the trade out
+            # before the thesis has a chance - this is the concrete risk-side response to "handle
+            # market shifts / spikes" rather than just flagging it informationally.
+            pad_mult *= 1.5
+            floor_mult *= 1.4
         seg = slice(max(0, tap_idx - 1), i + 1)
         if d == BULL:
             sl = min(tapped["bottom"], float(be.l[seg].min())) - pad_mult * a_e
@@ -378,6 +465,59 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
                      f"{'ready to fire' if pat_ok else 'tapped, waiting on a trigger candle' if zone_ok else 'not tapped yet'} "
                      f"- still needs 1H to flip {bias4.lower()} (currently {bias1.lower()}) before anything can fire"),
         }
+
+    # ---- the VICE VERSA case: 1H already has its OWN zone tap + trigger in ITS OWN direction, even
+    # though 4H hasn't confirmed it (or disagrees / has no clear structure yet). This never fires a
+    # trade (align_1h is still the hard gate) - it's the other half of "preview whichever timeframe is
+    # ready first", so a lagging 4H doesn't hide a setup that's actually already built on 1H.
+    one_h_preview = None
+    if h1.trend != 0 and h1.trend != d:
+        oscan = _entry_scan(h1, be, i, h1.trend, cfg, price, t)
+        if oscan["zone_ok"]:
+            one_h_preview = {
+                "would_be_direction": "BUY" if h1.trend == BULL else "SELL",
+                "zone_tapped": True, "trigger_ready": oscan["pat_ok"],
+                "zone": zone_json(h1.b, oscan["tapped"]),
+                "pattern": oscan["pattern"]["label"] if oscan["pattern"] else None,
+                "note": (f"1H itself is {bias1} with a zone already tapped on {tf_e} "
+                         f"{'and a trigger candle ready' if oscan['pat_ok'] else '- waiting on a trigger candle'} "
+                         f"- 4H ({bias4 if bias_ok else 'no clear structure'}) hasn't confirmed this direction yet"),
+            }
+
+    # ---- earliest possible heads-up: a decisive, momentum-backed candle printing AGAINST both HTF
+    # biases at once - often the first sign of a market shift or a spike, well before any zone/pattern
+    # logic tied to the current bias would react. Purely informational.
+    entry_shift_preview = None
+    for dd in (BULL, BEAR):
+        if bias_ok and dd == d:
+            continue
+        if h1.trend != 0 and dd == h1.trend:
+            continue
+        epat = candle_pattern(be, i, dd)
+        emom = _momentum(be, i, dd)
+        if epat and emom and emom["agree"]:
+            entry_shift_preview = {
+                "would_be_direction": "BUY" if dd == BULL else "SELL",
+                "pattern": epat["label"],
+                "note": (f"{tf_e} just printed a {epat['label'].lower()} with momentum against both 4H and 1H "
+                         f"bias - possible early market shift or spike, not confirmed by any higher timeframe yet"),
+            }
+            break
+
+    # ---- while we sit waiting on OUR trigger, is the opposite side quietly building its own zone tap?
+    # Answers "the wait might be another signal before ours fires" directly, instead of the user finding
+    # out only after the other side already fired.
+    counter_watch = None
+    if bias_ok and zone_ok and not pat_ok:
+        cscan = _entry_scan(h1, be, i, -d, cfg, price, t)
+        if cscan["zone_ok"]:
+            counter_watch = {
+                "direction": "BUY" if -d == BULL else "SELL",
+                "trigger_ready": cscan["pat_ok"],
+                "note": (f"While this {sign} trigger is pending, the opposite side already has its own 1H "
+                         f"zone tapped{' and a ready trigger candle' if cscan['pat_ok'] else ''} - it could fire "
+                         f"first if this wait drags on."),
+            }
 
     gates_ok = all(c["ok"] for c in checks if c["gate"])
     if fast and not gates_ok:
@@ -476,6 +616,11 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     got = sum(c["weight"] for c in applicable if c["ok"])
     agreement = 100.0 * got / tot if tot else 0.0
     grade = "A+" if agreement >= 85 else "A" if agreement >= 70 else "B" if agreement >= 55 else "C"
+    if volr and volr["spike"] and grade in ("A+", "A"):
+        # Every individual check can pass and the setup can still be less trustworthy than usual simply
+        # because the range itself is currently blown out - cap the grade one notch rather than let a
+        # spike-driven A+ look identical to a calm-market A+.
+        grade = "A" if grade == "A+" else "B"
 
     gates_ok = all(c["ok"] for c in checks if c["gate"])
     fired = gates_ok and agreement >= cfg.min_agreement
@@ -530,6 +675,12 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         highlights.append(tl_txt)
     if vs and vs.get("spike"):
         highlights.append(f"Volume spike ({vs['ratio']:.1f}x the {tf_e} average)")
+    if mom and mom.get("agree"):
+        highlights.append(f"Momentum backs the move ({abs(mom['roc_atr']):.2f}x ATR)")
+    if volr and volr.get("spike"):
+        highlights.append(f"Volatility spike on {tf_e} ({volr['ratio']:.1f}x normal) - stop widened for it")
+    if counter_watch:
+        highlights.append(counter_watch["note"])
 
     return {
         "direction": ("BUY" if d == BULL else "SELL") if fired else "WAIT",
@@ -540,7 +691,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         "risk": risk if zone_ok else None, "rr": cfg.rr,
         "tp_reason": tp_reason, "reward_r": round(abs(tp - price) / risk, 2) if (zone_ok and risk) else None,
         "breakeven_at_r": cfg.breakeven_at_r, "breakeven_price": breakeven_price,
-        "h1_preview": h1_preview, "highlights": highlights,
+        "h1_preview": h1_preview, "one_h_preview": one_h_preview, "entry_shift_preview": entry_shift_preview,
+        "counter_watch": counter_watch, "momentum": mom, "volatility": volr, "highlights": highlights,
         "candle_ts": t, "signal_time": t + cfg.entry_seconds, "candle_idx": i,
         "zone": zone_json(h1.b, tapped) if tapped else None, "watch_zone": watch,
         "pattern": ({**pattern, "ts": t} if pattern else None),
@@ -553,31 +705,52 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
 
 
 # -------------------------------------------------------------------- forming-candle preview
-def forming_watch(be: Bars, forming: dict | None, latest: dict, d: int) -> dict | None:
+def forming_watch(be: Bars, forming: dict | None, latest: dict, d: int, entry_seconds: int) -> dict | None:
     """Early heads-up only: peek at the STILL-OPEN entry-timeframe candle to see whether it is already
-    shaping up as the trigger the real signal is waiting on.
+    shaping up as the trigger the real signal is waiting on, OR (if we're still one step earlier) how
+    close price is to the zone it needs to tap first.
 
     This never fires a signal by itself and never feeds back into evaluate_entry/build_signal - the
     real BUY/SELL only ever comes from a fully closed candle (see evaluate_entry), so there is no
-    repainting risk. It only activates when everything else (4H bias, 1H alignment, the 1H zone tap)
-    is ALREADY true on closed data and the only thing missing is this candle finishing - i.e. exactly
-    the app's own 'waiting_trigger' status. Because the candle can still change shape until it closes,
-    this can flip or disappear on the next poll; that's expected and is why it's labelled 'forming'."""
-    if forming is None or d == 0 or latest.get("status") != "waiting_trigger":
+    repainting risk. Because the candle can still change shape until it closes, this can flip or
+    disappear on the next poll; that's expected and is why it's labelled 'forming'.
+
+    Every timestamp here is explicit (candle_open_ts / now_ts / elapsed_sec / remaining_sec) so the UI
+    can show a live countdown that is always inline with the moment the person is actually looking at
+    it, instead of a bare candle timestamp that quietly drifts stale between polls."""
+    status = latest.get("status")
+    if forming is None or d == 0 or status not in ("waiting_trigger", "waiting_zone"):
         return None
     i = be.n - 1
+    candle_open_ts = int(be.t[i]) + entry_seconds
+    now_ts = int(time.time())
+    timing = {"candle_open_ts": candle_open_ts, "now_ts": now_ts,
+              "elapsed_sec": max(0, now_ts - candle_open_ts),
+              "remaining_sec": max(0, entry_seconds - (now_ts - candle_open_ts))}
     prev_o, prev_c = float(be.o[i]), float(be.c[i])
     atr = float(be.atr[i])
     pat = _pattern_from_ohlc(prev_o, prev_c, forming["Open"], forming["High"], forming["Low"],
                              forming["Close"], atr, d)
+    if status == "waiting_zone":
+        wz = latest.get("watch_zone")
+        if not wz:
+            return None
+        return {
+            "status": "approaching_zone", "direction": "BUY" if d == BULL else "SELL",
+            "pattern": pat["label"] if pat else None, "zone": wz, "would_be_price": float(forming["Close"]),
+            "detail": (f"{wz['distance_atr']:.2f}x ATR from the 1H zone this setup needs to tap"
+                       + (f" - and the open candle is already shaping a {pat['label'].lower()}" if pat else "")),
+            **timing,
+        }
     if pat is None:
         return None
     return {
         "status": "forming", "direction": "BUY" if d == BULL else "SELL",
         "pattern": pat["label"],
-        "detail": f"{pat['label']} shaping up on the still-open candle - "
-                  f"only confirms if it closes this way, can still change",
+        "detail": (f"{pat['label']} shaping up on the still-open candle - only confirms if it closes this way, "
+                   f"can still change ({timing['remaining_sec']}s left on this candle)"),
         "zone": latest.get("zone"), "would_be_price": float(forming["Close"]),
+        **timing,
     }
 
 
@@ -618,7 +791,8 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
     sig["entry_price"] = sig.pop("entry", None)
     sig["risk_reward"] = cfg.rr
     sig["reason"] = " | ".join(f"{'OK' if c['ok'] else ('n/a' if c['ok'] is None else 'NO')}: {c['detail']}" for c in sig["checks"])
-    sig["forming"] = forming_watch(be, forming_bar, latest, h4.trend)
+    sig["forming"] = forming_watch(be, forming_bar, latest, h4.trend, cfg.entry_seconds)
+    sig["server_time"] = int(time.time())
 
     analysis = {
         "4h": tf_json(h4, price, "4h"),
@@ -638,6 +812,9 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
         "zone_hit": sig.get("zone"),
         "forming": sig.get("forming"),
         "h1_preview": sig.get("h1_preview"),
+        "one_h_preview": sig.get("one_h_preview"),
+        "entry_shift_preview": sig.get("entry_shift_preview"),
+        "counter_watch": sig.get("counter_watch"),
         "highlights": sig.get("highlights"),
     }
     return sig, analysis

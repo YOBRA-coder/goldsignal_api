@@ -185,11 +185,18 @@ def live_signal(
         except Exception:  # noqa: BLE001 - never let an alert-side bug break the live endpoint
             db.rollback()
 
-    # ---- scan log: record every evaluation (fired or not) so a quiet day is explainable, not opaque
+    # ---- scan log: record every evaluation (fired or not) so a quiet day is explainable, not opaque.
+    # Full checks + every preview object are stored (not just the headline) so nothing the engine saw
+    # is hidden from the user after the fact - see /signals/scan-log.
+    previews = {"forming": sig.get("forming"), "h1_preview": sig.get("h1_preview"),
+                "one_h_preview": sig.get("one_h_preview"), "entry_shift_preview": sig.get("entry_shift_preview"),
+                "counter_watch": sig.get("counter_watch"), "highlights": sig.get("highlights")}
     db.add(models.ScanLog(
         user_id=user.id, symbol=symbol, entry_interval=entry_interval, status=sig["status"],
         headline=sig["headline"], direction=sig["direction"] if sig["direction"] in ("BUY", "SELL") else None,
-        bias_4h=sig["bias_4h"], bias_1h=sig["bias_1h"], agreement=sig["agreement"]))
+        bias_4h=sig["bias_4h"], bias_1h=sig["bias_1h"], agreement=sig["agreement"], grade=sig.get("grade"),
+        momentum_agree=(sig.get("momentum") or {}).get("agree"), volatility_spike=(sig.get("volatility") or {}).get("spike"),
+        checks_json=json.dumps(sig["checks"]), previews_json=json.dumps(previews, default=str)))
     stale = db.query(models.ScanLog.id).filter(
         models.ScanLog.user_id == user.id, models.ScanLog.symbol == symbol,
         models.ScanLog.entry_interval == entry_interval).order_by(desc(models.ScanLog.ts)).offset(500).all()
@@ -254,18 +261,29 @@ def scan_log(
     symbol: str = "GC=F",
     entry_interval: Literal["1m", "5m", "15m", "30m"] | None = None,
     limit: int = Query(100, ge=1, le=500),
+    detail: bool = False,
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
 ):
     """Every evaluation the engine made (fired or not), newest first - the answer to 'what's it been
-    doing all day' and 'why hasn't this pair signalled yet'."""
+    doing all day' and 'why hasn't this pair signalled yet'. Pass detail=true for the full per-check
+    breakdown and every preview object (forming candle, early previews, counter-signal watch) instead
+    of just the one-line headline - nothing the engine saw is held back."""
     q = db.query(models.ScanLog).filter(models.ScanLog.user_id == user.id, models.ScanLog.symbol == symbol)
     if entry_interval:
         q = q.filter(models.ScanLog.entry_interval == entry_interval)
     rows = q.order_by(desc(models.ScanLog.ts)).limit(limit).all()
-    return [{"ts": int(r.ts.replace(tzinfo=timezone.utc).timestamp()), "entry_interval": r.entry_interval,
-            "status": r.status, "headline": r.headline, "direction": r.direction,
-            "bias_4h": r.bias_4h, "bias_1h": r.bias_1h, "agreement": r.agreement} for r in rows]
+    out = []
+    for r in rows:
+        row = {"ts": int(r.ts.replace(tzinfo=timezone.utc).timestamp()), "entry_interval": r.entry_interval,
+               "status": r.status, "headline": r.headline, "direction": r.direction,
+               "bias_4h": r.bias_4h, "bias_1h": r.bias_1h, "agreement": r.agreement, "grade": r.grade,
+               "momentum_agree": r.momentum_agree, "volatility_spike": r.volatility_spike}
+        if detail:
+            row["checks"] = json.loads(r.checks_json) if r.checks_json else []
+            row["previews"] = json.loads(r.previews_json) if r.previews_json else {}
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------- history
