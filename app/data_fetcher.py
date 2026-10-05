@@ -57,7 +57,16 @@ SUPPORTED = list(INTERVAL_SECONDS)
 DEFAULT_PERIOD = {"1m": "2d", "5m": "30d", "15m": "30d", "30m": "45d",
                   "1h": "365d", "1d": "2y", "1wk": "5y"}
 TTL = {"1m": 12, "5m": 90, "15m": 120, "30m": 180, "1h": 300, "1d": 120, "1wk": 600}
-FAIL_COOLDOWN = 60  # seconds before retrying a failed download
+FAIL_COOLDOWN = 25  # seconds before retrying a failed download (doubles on every repeated failure, capped below)
+FAIL_COOLDOWN_MAX = 300
+
+# Yahoo no longer serves some spot symbols ("No data found, symbol may be delisted"). When the symbol itself
+# returns nothing from every method, the closest live instrument is tried instead and the result is marked
+# as a proxy in the feed metadata. (Gold futures trade a little above spot - use the price calibration in Profile.)
+SYMBOL_FALLBACKS = {
+    "XAUUSD=X": ("XAUUSD=X", "GC=F", "MGC=F"),
+    "XAGUSD=X": ("XAGUSD=X", "SI=F"),
+}
 
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9=^.\-]{1,20}$")
 
@@ -170,118 +179,66 @@ def _fetch_yf_download(symbol: str, yf_interval: str, period: str) -> pd.DataFra
 
 # yfinance impersonates a browser (curl_cffi) and copes with Yahoo's cookie/crumb -> preferred.
 # The raw "direct" call is a fallback: from many networks Yahoo answers it with HTTP 429.
-# Yahoo methods for the requested symbol.
-# Keep this order conservative: yfinance first, then the raw chart endpoint,
-# then yf.download.  A method that receives a 429 is temporarily blocked.
 METHODS = (("yfinance.history", _fetch_yf_history), ("direct", _fetch_direct),
            ("yfinance.download", _fetch_yf_download))
 
-_method_block: dict[str, float] = {}
-_gate = threading.Semaphore(1)
+_method_block: dict[str, float] = {}      # method -> unix time until which we skip it
+_gate = threading.Semaphore(1)            # one Yahoo request at a time (yfinance/curl_cffi is not thread-safe)
 _last_call = [0.0]
 _call_lock = threading.Lock()
-
-# Yahoo can throttle an IP for considerably longer than a single request.
-# Do not immediately rotate through three methods after a 429.
-BLOCK_SECONDS = 180
-MIN_REQUEST_GAP = 1.0
-
-# Gold spot (XAUUSD=X) is occasionally unavailable from Yahoo even while
-# COMEX gold futures (GC=F) remains available.  GC=F is therefore a last-resort
-# market-data fallback, not a replacement for the requested symbol.
-GOLD_FALLBACKS = {"XAUUSD=X": ("GC=F",)}
-_FALLBACK_DIAGNOSTICS: dict[tuple, str] = {}
+BLOCK_SECONDS = 120
 
 
 def _throttle() -> None:
-    """Serialize Yahoo traffic and keep at least MIN_REQUEST_GAP between calls."""
+    """Space Yahoo requests >= 0.2 s apart so bursts of dashboard polling don't trigger 429."""
     with _call_lock:
-        wait = MIN_REQUEST_GAP - (time.time() - _last_call[0])
+        wait = 0.2 - (time.time() - _last_call[0])
         if wait > 0:
             time.sleep(wait)
         _last_call[0] = time.time()
 
 
-def _is_throttle_error(msg: str) -> bool:
-    s = msg.lower()
-    return (
-        "429" in s
-        or "too many requests" in s
-        or "rate limit" in s
-        or "rate" in s and "limit" in s
-    )
+def _download(symbol: str, yf_interval: str, period: str) -> tuple[pd.DataFrame, str, list[str]]:
+    """Try the symbol itself, then (for known-dead spot symbols) its fallback instruments."""
+    diag: list[str] = []
+    for alt in SYMBOL_FALLBACKS.get(symbol, (symbol,)):
+        try:
+            df, method, d = _download_one(alt, yf_interval, period)
+            if alt != symbol:
+                method = f"{method} (proxy {alt})"
+            return df, method, diag + d
+        except DataUnavailable as e:
+            diag += [f"[{alt}] {x}" for x in e.diagnostics]
+            if any("429" in x or "Too Many" in x for x in e.diagnostics):
+                break          # being rate limited: trying more symbols would only make it worse
+    raise DataUnavailable(f"Could not download {symbol} {yf_interval} from Yahoo Finance", diag)
 
 
 def _download_one(symbol: str, yf_interval: str, period: str) -> tuple[pd.DataFrame, str, list[str]]:
-    """Try each Yahoo transport once, respecting method cooldowns."""
     diag: list[str] = []
     now = time.time()
-    available = [m for m in METHODS if _method_block.get(m[0], 0) <= now]
-
-    # If every method is blocked, do not hammer Yahoo by ignoring the cooldown.
-    if not available:
-        remaining = max(1, int(min(_method_block.values()) - now))
-        raise DataUnavailable(
-            f"Yahoo methods temporarily throttled for {symbol} {yf_interval} "
-            f"(retry in about {remaining}s)",
-            [f"all methods blocked; retry in about {remaining}s"],
-        )
-
-    for name, fn in available:
+    order = [m for m in METHODS if _method_block.get(m[0], 0) <= now] or list(METHODS)
+    for name, fn in order:
         try:
             with _gate:
                 _throttle()
                 df = fn(symbol, yf_interval, period)
-            if df is not None and len(df):
+            if len(df):
                 return df, name, diag
             diag.append(f"{name}: no rows")
         except Exception as e:  # noqa: BLE001
             msg = f"{type(e).__name__}: {str(e)[:110]}"
             diag.append(f"{name}: {msg}")
-            if _is_throttle_error(msg):
-                _method_block[name] = time.time() + BLOCK_SECONDS
-
-    raise DataUnavailable(
-        f"Could not download {symbol} {yf_interval} from Yahoo Finance", diag
-    )
-
-
-def _download(symbol: str, yf_interval: str, period: str) -> tuple[pd.DataFrame, str, list[str]]:
-    """
-    Download the requested symbol.  For XAUUSD=X, fall back to GC=F only when
-    the requested Yahoo spot feed is unavailable.
-
-    The fallback is explicitly marked in the returned source string so the UI
-    and health endpoint can tell the difference.
-    """
-    try:
-        return _download_one(symbol, yf_interval, period)
-    except DataUnavailable as primary:
-        fallback_symbols = GOLD_FALLBACKS.get(symbol, ())
-        if not fallback_symbols:
-            raise
-
-        diag = list(primary.diagnostics)
-        for fallback in fallback_symbols:
-            try:
-                df, method, fdiag = _download_one(fallback, yf_interval, period)
-                source = f"{method} ({fallback} fallback for {symbol})"
-                diag.extend([f"fallback {fallback}: {x}" for x in fdiag])
-                _FALLBACK_DIAGNOSTICS[(symbol, yf_interval, period)] = source
-                return df, source, diag
-            except DataUnavailable as e:
-                diag.extend([f"fallback {fallback}: {x}" for x in e.diagnostics])
-
-        raise DataUnavailable(
-            f"Could not download {symbol} {yf_interval}; primary and gold fallback failed",
-            diag,
-        )
+            if "429" in msg or "Too Many" in msg or "Rate" in msg:
+                _method_block[name] = time.time() + BLOCK_SECONDS  # stop poking a method that is being throttled
+    raise DataUnavailable(f"Could not download {symbol} {yf_interval} from Yahoo Finance", diag)
 
 
 # ---------------------------------------------------------------------- caching
 _mem: dict[tuple, tuple[float, pd.DataFrame]] = {}
 _meta: dict[tuple, dict] = {}
 _fail_until: dict[tuple, tuple[float, list[str]]] = {}
+_fail_count: dict[tuple, int] = {}
 _locks: dict[tuple, threading.Lock] = {}
 _glock = threading.Lock()
 LAST_DIAGNOSTICS: dict = {"ok": None, "at": None, "detail": []}
@@ -352,9 +309,11 @@ def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.Dat
             except OSError:
                 pass
             _fail_until.pop(key, None)
+            _fail_count.pop(key, None)
             return df
         except DataUnavailable as e:
-            _fail_until[key] = (time.time() + FAIL_COOLDOWN, e.diagnostics)
+            n = _fail_count[key] = _fail_count.get(key, 0) + 1
+            _fail_until[key] = (time.time() + min(FAIL_COOLDOWN * 2 ** (n - 1), FAIL_COOLDOWN_MAX), e.diagnostics)
             LAST_DIAGNOSTICS.update(ok=False, at=int(time.time()), detail=[f"{symbol} {yf_interval}"] + e.diagnostics)
             log.warning("Data download failed %s %s: %s", symbol, yf_interval, e.diagnostics)
             if stale is not None:
@@ -415,15 +374,6 @@ def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
     """
     if interval == "1m" or base.empty:
         return base
-
-    # When the base frame is already being served from a fallback/cache, avoid
-    # immediately generating another Yahoo request for the 1m tape.  This is
-    # especially important for XAUUSD=X during Yahoo spot-feed outages.
-    base_meta = get_meta(symbol, YF_INTERVAL.get(interval, interval))
-    source = str(base_meta.get("source", ""))
-    if "fallback" in source:
-        return base
-
     try:
         m1 = _get_raw(symbol, "1m")
     except DataUnavailable:
@@ -556,27 +506,13 @@ def feed_health(symbol: str = "GC=F") -> dict:
     except Exception:  # noqa: BLE001
         ver = "not installed"
     ok = any(m["ok"] for m in out)
-    return {
-        "demo": False,
-        "ok": ok,
-        "yfinance_version": ver,
-        "methods": out,
-        "gold_fallbacks": GOLD_FALLBACKS,
-        "method_cooldowns": {
-            name: max(0, int(until - time.time()))
-            for name, until in _method_block.items()
-            if until > time.time()
-        },
-        "hint": None if ok else
-        "All Yahoo download methods failed. Run: pip install -U -r requirements.txt "
-        "(yfinance must be recent), then check this machine can reach "
-        "query1.finance.yahoo.com (VPN / firewall / DNS). XAUUSD=X also has GC=F "
-        "as a fallback when Yahoo's spot feed is unavailable.",
-    }
+    return {"demo": False, "ok": ok, "yfinance_version": ver, "methods": out,
+            "hint": None if ok else
+            "All download methods failed. Run: pip install -U -r requirements.txt (yfinance must be recent), "
+            "then check this machine can reach query1.finance.yahoo.com (VPN / firewall / DNS)."}
 
 
 def clear_caches() -> None:
     _mem.clear()
     _fail_until.clear()
-    _method_block.clear()
-    _FALLBACK_DIAGNOSTICS.clear()
+    _fail_count.clear()
