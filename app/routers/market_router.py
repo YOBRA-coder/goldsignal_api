@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 from .. import auth, models, sessions, settings
 from ..data_fetcher import (DataUnavailable, INTERVAL_SECONDS, LAST_DIAGNOSTICS, data_status, drop_incomplete,
                             feed_health, get_candles, is_futures, raw_last_price)
+from .. import analyst
+from .. import strategy as strat
 from ..levels import key_levels
 from ..strategy import own_structure, quick_bias
 from ..structure import atr_array
@@ -59,9 +62,13 @@ def candles(
             "has_volume": bool(np.nansum(v[-80:]) > 0), "structure": struct}
 
 
-def _quote(symbol: str, live: bool = True) -> dict:
-    """Last price + day change. live=True uses the 1-minute tape (updates every few seconds)."""
-    d = get_candles(symbol, "1d", live=live)
+_WATCH_CACHE: dict = {}
+
+
+def _quote(symbol: str, live: bool = True, period: str | None = None) -> dict:
+    """Last price + day change. live=True uses the 1-minute tape (updates every few seconds).
+    period: a short history window (e.g. "30d") keeps the download small for list views."""
+    d = get_candles(symbol, "1d", period=period, live=live)
     if len(d) < 2:
         raise DataUnavailable("not enough daily data")
     last_bar = d.iloc[-1]
@@ -88,17 +95,27 @@ def quote(symbol: str = "GC=F", user: models.User = Depends(auth.get_current_use
 
 
 @router.get("/watchlist")
-def watchlist(symbols: str = "GC=F,XAUUSD=X,SI=F,EURUSD=X,GBPUSD=X,USDJPY=X,EURAUD=X", user: models.User = Depends(auth.get_current_user)):
-    syms = [s.strip() for s in symbols.split(",") if s.strip()][:12]
+def watchlist(symbols: str = "GC=F,XAUUSD=X,SI=F,EURUSD=X,GBPUSD=X,USDJPY=X,EURAUD=X,GBPNZD=X",
+              user: models.User = Depends(auth.get_current_user)):
+    """Prices for the whole pair list. Cached for a minute and bounded to 40 symbols so the Market page (and
+    switching pairs) can never queue up dozens of Yahoo downloads behind the live analysis."""
+    syms = [s.strip() for s in symbols.split(",") if s.strip()][:40]
+    now = time.time()
+    key = ",".join(syms)
+    hit = _WATCH_CACHE.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
 
     def one(s):
         try:
-            return {**_quote(s, live=False), "ok": True}
+            return {**_quote(s, live=False, period="30d"), "ok": True}
         except Exception as e:  # noqa: BLE001
             return {"symbol": s, "ok": False, "error": str(e)[:80]}
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        return {"quotes": list(ex.map(one, syms))}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        out = {"quotes": list(ex.map(one, syms))}
+    _WATCH_CACHE[key] = (now, out)
+    return out
 
 
 @router.get("/overview")
@@ -201,3 +218,46 @@ def calibrate(body: CalibrateBody, user: models.User = Depends(auth.get_current_
         raise HTTPException(400, f"That price ({body.mt5_price}) is too far from the feed ({raw:.2f}) - check the symbol.")
     settings.set_offset(body.symbol, round(off, 5), int(time.time()))
     return _mt5_state(body.symbol)
+
+
+# ------------------------------------------------------------ analyst: the full market read
+_READ_CACHE: dict = {}
+
+
+@router.get("/analysis")
+def analysis(
+    symbol: str = "GC=F",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
+    rr: float = Query(2.0, ge=0.5, le=10),
+    min_agreement: float = Query(70, ge=0, le=100),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Everything happening in this market in one read: trend consensus across timeframes, regime, support /
+    resistance, liquidity, session timing and a buy plan + sell plan with the clock-time window to expect them."""
+    import time as _t
+    from .signals_router import _make_cfg
+    key = (symbol, entry_interval, round(rr, 2), round(min_agreement))
+    hit = _READ_CACHE.get(key)
+    if hit and _t.time() - hit[0] < 15:
+        return hit[1]
+    try:
+        raw = {tf: get_candles(symbol, tf) for tf in ("5m", "15m", "30m", "1h", "4h", "1d", "1w")}
+    except DataUnavailable as e:
+        raise _503(e)
+    closed = {tf: drop_incomplete(df, tf) for tf, df in raw.items()}
+    d4, d1 = closed["4h"], closed["1h"]
+    de = closed.get(entry_interval) if entry_interval in closed else drop_incomplete(get_candles(symbol, entry_interval), entry_interval)
+    if len(d4) < strat.MIN_BARS["4h"] or len(d1) < strat.MIN_BARS["1h"] or len(de) < strat.MIN_BARS["entry"]:
+        raise HTTPException(503, detail={"message": f"Not enough history for {symbol} yet."})
+    price = float(raw[entry_interval if entry_interval in raw else "15m"]["Close"].iloc[-1])
+    levels = key_levels(raw["1d"], raw["1w"], d1, price)
+    futures = is_futures(symbol)
+    status = data_status(symbol, entry_interval, raw["15m"])
+    market_ok = status["market_open"] and not status["stale"]
+    cfg = _make_cfg("swing", rr, min_agreement, True, entry_interval, 1.0)
+    ctx = strat.make_ctx(d4, d1)
+    sig, _ = strat.build_signal(d4, d1, de, cfg, levels, sessions.allowed_mask(de.index), market_ok, ctx=ctx, futures=futures)
+    out = analyst.build_market_read(symbol, price, closed, ctx[0], ctx[1], sig, levels,
+                                    sessions.session_state(futures=futures), entry_interval, futures, status)
+    _READ_CACHE[key] = (_t.time(), out)
+    return out

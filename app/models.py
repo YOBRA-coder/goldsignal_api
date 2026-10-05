@@ -55,6 +55,19 @@ class SignalRecord(Base):
     outcome_price = Column(Float, nullable=True)
     outcome = Column(String, nullable=True)         # auto / manual
 
+    # --- added in v3 (auto-migrated): multi-trade tracking + live watching
+    style = Column(String, nullable=True)           # swing / scalp
+    trade_type = Column(String, nullable=True)      # e.g. "Swing BUY", "Scalp SELL"
+    current_sl = Column(Float, nullable=True)       # stop as managed (moves to entry after +1R)
+    be_moved = Column(Boolean, nullable=True)
+    max_r = Column(Float, nullable=True)            # best excursion so far, in R
+    min_r = Column(Float, nullable=True)            # worst excursion so far, in R (negative)
+    health = Column(String, nullable=True)          # healthy / building / protected / near_target / caution / danger
+    health_note = Column(Text, nullable=True)
+    last_event = Column(String, nullable=True)      # dedupe key so a change alerts once
+    plan_json = Column(Text, nullable=True)         # zone, confirmations, biases at entry (the "thesis")
+    events_json = Column(Text, nullable=True)       # timeline: breakeven, warnings, exit
+
     owner = relationship("User", back_populates="signals")
 
 

@@ -132,3 +132,56 @@ def test_price_offset_shifts_every_timeframe():
         assert abs(f.get_candles("GC=F", "4h")["High"].iloc[-1] - f.resample_ohlc(f._candles("GC=F", "1h", None, True), "4h")["High"].iloc[-1] - 12.5) < 1e-6
     finally:
         settings.set_offset("GC=F", None)
+
+
+# ------------------------------------------------------------- trade tracker / confirmations / indicators
+def test_replay_breakeven_win_loss():
+    from app import trades
+    t = np.arange(0, 6 * 900, 900)
+    tr = {"direction": "BUY", "entry": 100.0, "sl": 99.0, "tp": 102.0, "start_ts": 0}
+    # +1R then back to entry -> breakeven, 0R
+    o = np.array([100, 100.5, 101.2, 100.5, 100, 100.0]); h = o + 0.3; l = o - 0.1
+    l = np.array([99.9, 100.2, 100.9, 100.2, 99.9, 99.9]); h = np.array([100.3, 101.2, 101.4, 100.8, 100.2, 100.1])
+    r = trades.replay(tr, t, o, h, l, o)
+    assert r["status"] == "breakeven" and r["result_r"] == 0.0 and r["be_moved"]
+    # straight to target -> win 2R
+    h2 = np.array([100.5, 101.5, 102.1, 102.2, 102.3, 102.4]); l2 = np.array([99.9, 100.4, 101.4, 101.9, 102, 102])
+    r = trades.replay(tr, t, o, h2, l2, o)
+    assert r["status"] == "won" and r["result_r"] == 2.0
+    # straight down -> loss -1R
+    h3 = np.array([100.1, 100.0, 99.5, 99, 99, 99]); l3 = np.array([99.5, 98.9, 98.5, 98, 98, 98])
+    r = trades.replay(tr, t, o, h3, l3, o)
+    assert r["status"] == "lost" and r["result_r"] == -1.0
+    # SELL mirror
+    s = {"direction": "SELL", "entry": 100.0, "sl": 101.0, "tp": 98.0, "start_ts": 0}
+    r = trades.replay(s, t, o, np.array([100.1, 99.9, 99.5, 99.5, 99.5, 99.5]), np.array([99.5, 97.9, 97, 97, 97, 97]), o)
+    assert r["status"] == "won"
+
+
+def test_can_open_rules():
+    from app import trades
+    run = [{"direction": "BUY", "entry": 100.0, "sl": 99.0, "plan": {}}]
+    new = {"direction": "BUY", "entry": 100.2, "sl": 99.2}
+    assert not trades.can_open(run, new)[0]                       # same level
+    assert trades.can_open(run, {"direction": "BUY", "entry": 103.0, "sl": 102.0})[0]
+    assert trades.can_open(run, {"direction": "SELL", "entry": 100.1, "sl": 101.1})[0]
+    assert not trades.can_open(run * 3, {"direction": "BUY", "entry": 120.0, "sl": 119.0})[0]   # max 3
+
+
+def test_indicators_are_causal():
+    from app import indicators as ix
+    rng = np.random.default_rng(1)
+    c = 100 + np.cumsum(rng.normal(0, 1, 300))
+    h, l = c + 1, c - 1
+    full = (ix.rsi(c), ix.adx(h, l, c)[0], ix.macd(c)[2], ix.efficiency_ratio(c))
+    cut = (ix.rsi(c[:200]), ix.adx(h[:200], l[:200], c[:200])[0], ix.macd(c[:200])[2], ix.efficiency_ratio(c[:200]))
+    for a, b in zip(full, cut):
+        assert np.allclose(a[:200], b, atol=1e-9)                 # value at bar i never depends on later bars
+    assert 0 <= full[0].min() and full[0].max() <= 100
+
+
+def test_backtest_concurrent_and_styles_run():
+    df = _frame(list(100 + 5 * np.sin(np.arange(1500) / 20.0)))
+    for kw in ({"max_open": 1}, {"max_open": 3}, {"style": "scalp", "max_open": 2}):
+        out = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", None, 1.0, **kw)
+        assert "total_trades" in out and "breakevens" in out

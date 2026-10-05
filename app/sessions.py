@@ -144,3 +144,69 @@ def session_state(now: datetime | None = None, futures: bool = True) -> dict:
         "trade_allowed": allowed,
         "sessions": sessions,
     }
+
+
+# ------------------------------------------------------------------ planning helpers (v3)
+def trade_allowed_at(ts: int, futures: bool = True) -> bool:
+    """Is a signal allowed at this moment (market open AND London and/or New York open)?"""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return market_open(dt, futures) and any(_is_open(k, dt) for k in TRADE_SESSIONS)
+
+
+def next_trade_window(ts: int, futures: bool = True, horizon_days: int = 9) -> int | None:
+    """First time >= ts at which signals are allowed (steps of 5 min, so it lands on the open)."""
+    t = (int(ts) // 300) * 300
+    for _ in range(horizon_days * 288):
+        if trade_allowed_at(t, futures):
+            return max(t, int(ts))
+        t += 300
+    return None
+
+
+def advance_open_time(start_ts: int, bars: int, step: int, futures: bool = True, cap_days: int = 7) -> int | None:
+    """Clock time reached after `bars` entry-timeframe bars of OPEN-market time (the market is closed at
+    weekends / the daily break, so a plain `start + bars*step` would be wrong). None = beyond the cap."""
+    t, n = int(start_ts), 0
+    limit = start_ts + cap_days * 86400
+    while n < bars:
+        t += step
+        if t > limit:
+            return None
+        if market_open(datetime.fromtimestamp(t, tz=timezone.utc), futures):
+            n += 1
+    return t
+
+
+def upcoming_windows(now: datetime | None = None, futures: bool = True) -> list[dict]:
+    """Next session opens/closes and the usual US-data slot, soonest first (for the 'when to expect' panel)."""
+    now = _utc(now)
+    rows = []
+    for name in ("asia", "london", "ny"):
+        for want_open in (True, False):
+            e = _next_edge(name, now, want_open)
+            if e:
+                rows.append({"ts": int(e.timestamp()), "kind": "open" if want_open else "close", "key": name,
+                             "label": f"{LABELS[name]} {'opens' if want_open else 'closes'}"})
+    # 08:30 New York on weekdays = the usual slot for US data (CPI, NFP, jobless claims ...). It is a TYPICAL
+    # time, not a calendar - always check an economic calendar for the real release schedule.
+    t = now.astimezone(NY).replace(hour=8, minute=30, second=0, microsecond=0)
+    for _ in range(8):
+        if t > now.astimezone(NY) and t.weekday() < 5:
+            rows.append({"ts": int(t.timestamp()), "kind": "data", "key": "us_data",
+                         "label": "Typical US data slot (08:30 NY) - check the economic calendar"})
+            break
+        t += timedelta(days=1)
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def minutes_to_market_close(now: datetime | None = None, futures: bool = True) -> float | None:
+    """Minutes until the next market closure (daily break for futures / weekend). None if already closed."""
+    now = _utc(now)
+    if not market_open(now, futures):
+        return None
+    t = now.replace(second=0, microsecond=0)
+    for k in range(1, 60 * 24 * 8):
+        if not market_open(t + timedelta(minutes=k), futures):
+            return float(k)
+    return None

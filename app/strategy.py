@@ -14,12 +14,17 @@ fires only when every gate passes AND the weighted agreement >= min_agreement.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
+from . import confirm as cf
+from . import sessions as _sessions
+from .indicators import ind
 from .structure import (BULL, BEAR, Bars, _pattern_from_ohlc, analyze_structure, base_zones, bias_name,
                         candle_pattern, find_fvgs, find_swings, liquidity, merge_zones, mini_bos, num,
                         trendlines, volume_spike, zigzag, zones_from_events)
@@ -69,6 +74,17 @@ class Cfg:
     entry_seconds: int = 900
     entry_interval: str = "15m"
     breakeven_at_r: float = 1.0  # once a trade is +this many R in favor, move the stop to entry
+    # ---- v3 upgrades. Each one is switchable so the original behaviour can be reproduced and A/B tested.
+    style: str = "swing"         # "swing": 4H + 1H aligned (trend continuation) | "scalp": 1H-led short-term trade
+    ext_patterns: bool = True    # confirmation candles beyond engulfing / rejection (stars, tweezers, thrust, ...)
+    ext_confirms: bool = True    # context confirmations beyond mini-BOS / volume (sweep, RSI, MACD, EMA reclaim)
+    min_confirms: int = 1        # independent confirmations needed on top of the trigger candle
+    no_chase: bool = False       # block entries into an already-stretched move (RSI extreme)
+    rsi_max: float = 60.0        # direction-adjusted entry-TF RSI above this = chasing
+    rsi1_max: float = 70.0       # same for the 1H RSI
+    fvg_extra: bool = False      # a gap-only zone tap must be backed by one more confirmation than an order block
+    scalp_rr: float = 1.5        # scalps aim for a nearer target
+    max_open: int = 3            # concurrent trades per symbol (live tracker + backtest)
 
 
 # ------------------------------------------------------------------- contexts
@@ -313,8 +329,12 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
                    levels: list | None = None, fast: bool = False) -> dict:
     """Evaluate the whole rule-set on closed entry-TF candle `i` (uses data <= i only)."""
     levels = levels or []
-    d = h4.trend
-    bias4, bias1 = bias_name(d), bias_name(h1.trend)
+    scalp = cfg.style == "scalp"
+    # swing = classic top-down (4H sets the direction, 1H must agree).
+    # scalp = 1H-led: 1H has a direction of its own that 4H has NOT confirmed (neutral or opposite) - a
+    #         shorter-term trade, so it targets a nearer level and needs more confirmation.
+    d = (h1.trend if (h1.trend != 0 and h1.trend != h4.trend) else 0) if scalp else h4.trend
+    bias4, bias1 = bias_name(h4.trend), bias_name(h1.trend)
     price, t = float(be.c[i]), int(be.t[i])
     a_e, a_1, a_4 = float(be.atr[i]), float(h1.b.atr[-1]), float(h4.b.atr[-1])
     checks: list[dict] = []
@@ -324,14 +344,20 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
 
     # ---- STEP 1: 4H direction
     bias_ok = d != 0
-    _add(checks, "bias_4h", "4H structure sets direction", 1, bias_ok,
-         f"4H is {bias4.upper()}" + (f" ({'HH/HL' if d == BULL else 'LH/LL'}, {h4.st['run']} break(s) in a row)" if bias_ok
-                                     else " - no clear structure, stand aside"), 2.0, True, "4H")
+    if scalp:
+        _add(checks, "bias_4h", "1H leads while 4H has not confirmed (short-term trade)", 1, bias_ok,
+             (f"1H is {bias1.upper()} while 4H is {bias4.upper()} - scalp only, nearer target" if bias_ok
+              else "1H has no direction of its own against 4H - no scalp"), 2.0, True, "1H")
+    else:
+        _add(checks, "bias_4h", "4H structure sets direction", 1, bias_ok,
+             f"4H is {bias4.upper()}" + (f" ({'HH/HL' if d == BULL else 'LH/LL'}, {h4.st['run']} break(s) in a row)" if bias_ok
+                                         else " - no clear structure, stand aside"), 2.0, True, "4H")
 
     # ---- STEP 3: 1H alignment
-    align_ok = bias_ok and h1.trend == d
-    _add(checks, "align_1h", "1H structure aligns with 4H", 3, align_ok,
-         f"1H is {bias1.upper()} vs 4H {bias4.upper()}" + ("" if align_ok else " - not aligned = no bias, no trade"),
+    align_ok = bias_ok and (True if scalp else h1.trend == d)
+    _add(checks, "align_1h", "1H structure leads the trade" if scalp else "1H structure aligns with 4H", 3, align_ok,
+         (f"1H {bias1.upper()} sets the direction" if scalp else f"1H is {bias1.upper()} vs 4H {bias4.upper()}")
+         + ("" if align_ok else " - not aligned = no bias, no trade"),
          2.0, True, "1H")
 
     # ---- zone candidates on 1H (refined OB / FVG of the right type)
@@ -364,12 +390,33 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         zdet = "No valid 1H OB/FVG of the right type yet"
     _add(checks, "zone_1h", "Price inside 1H refined OB / FVG", 3, zone_ok, zdet, 2.0, True, "1H")
 
-    # ---- trigger candle on the entry timeframe
-    pattern = candle_pattern(be, i, d) if bias_ok else None
+    # ---- trigger candle on the entry timeframe (engulfing / rejection wick, plus - with ext_patterns - morning/
+    # evening star, piercing / dark cloud, tweezer, inside-bar breakout and momentum-thrust candles)
+    pats: list[dict] = []
+    if bias_ok:
+        pats = cf.candle_patterns(be, i, d) if cfg.ext_patterns else \
+            ([p0] if (p0 := candle_pattern(be, i, d)) else [])
+    pattern = pats[0] if pats else None
     pat_ok = pattern is not None and zone_ok
-    _add(checks, "candle", f"{tf_e} engulfing / rejection wick at the zone", 4, pat_ok,
+    _add(checks, "candle", f"{tf_e} confirmation candle at the zone" if cfg.ext_patterns
+         else f"{tf_e} engulfing / rejection wick at the zone", 4, pat_ok,
          (pattern["label"] if pat_ok else f"{pattern['label']} - ignored, not at a 1H zone") if pattern
          else "No confirmation candle on the last closed bar", 2.0, True, tf_e)
+
+    # ---- anti-chase: do not buy after the move is already stretched (RSI high) / sell into an oversold flush.
+    # Measured on cached history: entries taken with the direction-adjusted RSI above ~60 lost money, entries
+    # on a pullback (RSI <= 50) made it - the zone tap is meant to be a PULLBACK entry, not a breakout chase.
+    if cfg.no_chase:
+        chase_ok, chase_txt = True, "No bias yet"
+        if bias_ok:
+            ex = cf.extension(be, i, d)
+            r1 = float(ind(h1.b).rsi14[-1])
+            r1d = r1 if d == BULL else 100.0 - r1
+            chase_ok = ex["rsi_dir"] <= cfg.rsi_max and r1d <= cfg.rsi1_max
+            chase_txt = (f"{tf_e} RSI {ex['rsi']:.0f} / 1H RSI {r1:.0f} - pullback entry, not a chase" if chase_ok
+                         else f"{tf_e} RSI {ex['rsi']:.0f} / 1H RSI {r1:.0f} - move already stretched, would be chasing")
+        _add(checks, "extension", "Not chasing a stretched move (RSI)", 4, chase_ok if bias_ok else None, chase_txt,
+             0.0, True, tf_e)
 
     # ---- trigger must NOT be standing alone: at least one of mini-BOS / volume spike has to back it
     # up, or it's too easily just noise on the entry timeframe (computed once here, reused below so we
@@ -378,13 +425,51 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     mb_recent = _tf_scale(cfg.entry_seconds, 3)
     bos = mini_bos(be, i, d, window=mb_window, recent=mb_recent) if bias_ok and zone_ok else None
     vs = volume_spike(be, i, lookback=_tf_scale(cfg.entry_seconds, 20))
-    confluence_ok = bool(pat_ok and (bos is not None or (vs and vs["spike"])))
-    conf_bits = [n for n, ok in (("mini BOS", bos is not None), ("volume spike", bool(vs and vs["spike"]))) if ok]
-    _add(checks, "confluence", "Mini BOS or volume spike backs up the trigger candle", 4,
+
+    # liquidity sweeps (1H and entry TF) - computed lazily because it is the most expensive confirmation
+    _sw: dict = {}
+
+    def sweeps() -> dict:
+        if not _sw:
+            n1_ = h1.b.n
+            lo_ = max(0, i - 60)
+            sb_ = _sub_bars(be, lo_, i + 1)
+            _, esw_ = liquidity(sb_, zigzag(find_swings(sb_, 2, 2), 2))
+            esw_ = [q for q in esw_ if q["dir"] == d and q["idx"] >= sb_.n - 12]
+            se_ = esw_[-1] if esw_ else None
+            _sw.update(sw1=[q for q in h1.sweeps if q["dir"] == d and q["idx"] >= n1_ - 24], sweep_e=se_,
+                       sweep_e_ts=int(sb_.t[se_["idx"]]) if se_ else None)
+        return _sw
+
+    # independent confirmations behind the trigger candle. Old rule: mini BOS or volume spike (volume does not
+    # exist for spot FX / XAUUSD on Yahoo, so on those the single mini-BOS carried everything).
+    conf: list[str] = []
+    if bos is not None:
+        conf.append(f"Mini BOS through {bos['level']:.2f}")
+    if vs and vs["spike"]:
+        conf.append(f"Volume spike {vs['ratio']:.1f}x")
+    if pat_ok and cfg.ext_confirms:
+        sw_ = sweeps()
+        if sw_["sw1"] or sw_["sweep_e"]:
+            conf.append(f"{'Sell' if d == BULL else 'Buy'}-side liquidity swept")
+        for fn in (cf.rsi_reversal, cf.macd_turn, cf.ema_reclaim):
+            hit = fn(be, i, d)
+            if hit:
+                conf.append(hit["label"])
+    need = cfg.min_confirms
+    if cfg.fvg_extra and tapped is not None and tapped["source"] == "FVG":
+        need += 1                      # a gap-only tap is the weaker zone: ask for one more reason
+    if scalp:
+        need += 1                      # short-term trade against the 4H: ask for one more reason
+    confluence_ok = bool(pat_ok and len(conf) >= need)
+    _add(checks, "confluence", (f"At least {need} independent confirmation{'s' if need > 1 else ''} behind the trigger candle"
+                                if cfg.ext_confirms or need > 1 else
+                                "Mini BOS or volume spike backs up the trigger candle"), 4,
          confluence_ok if pat_ok else None,
-         ("Backed by " + " + ".join(conf_bits) if confluence_ok else
-          "Trigger candle stands alone - no mini BOS or volume spike behind it" if pat_ok else
-          "No confirmation candle yet"), 0.0, True, tf_e)
+         (f"{len(conf)} backing it: " + " + ".join(conf) if confluence_ok else
+          (f"Trigger candle has {len(conf)} of the {need} confirmations needed" + (f" ({' + '.join(conf)})" if conf else
+                                                                                  " - it stands alone"))
+          if pat_ok else "No confirmation candle yet"), 0.0, True, tf_e)
 
     # ---- session gate
     sess_gate = cfg.sessions_only
@@ -413,6 +498,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     entry = sl = tp = risk = None
     risk_ok = False
     tp_reason = None
+    rr_used = min(cfg.rr, cfg.scalp_rr) if scalp else cfg.rr
     if zone_ok:
         # Below 15m, a fixed-ATR stop that's fine on 15m/30m sits so close to price that ordinary
         # noise (and real-world spread) stops the trade out before the 4H/1H thesis has had room to
@@ -430,13 +516,13 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
             sl = min(tapped["bottom"], float(be.l[seg].min())) - pad_mult * a_e
             risk = max(price - sl, floor_mult * a_e)
             sl = price - risk
-            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, cfg.rr, levels)
+            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, rr_used, levels)
             tp = price + tgt_dist
         else:
             sl = max(tapped["top"], float(be.h[seg].max())) + pad_mult * a_e
             risk = max(sl - price, floor_mult * a_e)
             sl = price + risk
-            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, cfg.rr, levels)
+            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, rr_used, levels)
             tp = price - tgt_dist
         entry = price
         risk_ok = risk <= 3.0 * a_1
@@ -449,12 +535,22 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     if zone_ok and risk:
         breakeven_price = price + cfg.breakeven_at_r * risk if d == BULL else price - cfg.breakeven_at_r * risk
 
+    # ---- retest entry: the trigger candle's mid-point. Same stop, same target, but a smaller risk -> better R:R,
+    # at the cost of the order not always filling. Reported as an OPTION; the trade tracker / backtest decide.
+    retest = None
+    if zone_ok and risk and tp is not None:
+        mid = (float(be.h[i]) + float(be.l[i])) / 2.0
+        r_lim = (mid - sl) if d == BULL else (sl - mid)
+        if 0 < r_lim <= 0.85 * risk:
+            retest = {"price": mid, "risk": r_lim, "reward_r": round(abs(tp - mid) / r_lim, 2),
+                      "valid_bars": _tf_scale(cfg.entry_seconds, 6)}
+
     # ---- early preview: 4H direction is already set but 1H hasn't confirmed it yet. The zone/pattern/
     # risk work above only ever depended on bias_ok (4H), never on align_ok (1H) - so if 1H is just
     # lagging, we already know exactly what this timeframe's setup looks like. Never used to fire a
     # trade (align_1h is still a hard gate below) - purely a heads-up on what's forming.
     h1_preview = None
-    if bias_ok and not align_ok:
+    if bias_ok and not align_ok and not scalp:
         h1_preview = {
             "would_be_direction": "BUY" if d == BULL else "SELL",
             "zone_tapped": zone_ok, "trigger_ready": pat_ok,
@@ -471,7 +567,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     # trade (align_1h is still the hard gate) - it's the other half of "preview whichever timeframe is
     # ready first", so a lagging 4H doesn't hide a setup that's actually already built on 1H.
     one_h_preview = None
-    if h1.trend != 0 and h1.trend != d:
+    if not scalp and h1.trend != 0 and h1.trend != d:
         oscan = _entry_scan(h1, be, i, h1.trend, cfg, price, t)
         if oscan["zone_ok"]:
             one_h_preview = {
@@ -575,13 +671,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
          (f"Last 1H {last_ev['type']} {'up' if last_ev['dir'] == BULL else 'down'} {n1 - 1 - last_ev['idx']} bars ago"
           if last_ev else "No 1H structure break"), 1.0, False, "1H")
 
-    sw1 = [s for s in h1.sweeps if s["dir"] == d and s["idx"] >= n1 - 24]
-    lo = max(0, i - 60)
-    sb = _sub_bars(be, lo, i + 1)
-    _, esw = liquidity(sb, zigzag(find_swings(sb, 2, 2), 2))
-    esw = [s for s in esw if s["dir"] == d and s["idx"] >= sb.n - 12]
-    sweep_e = esw[-1] if esw else None
-    sweep_e_ts = int(sb.t[sweep_e["idx"]]) if sweep_e else None
+    sw_ = sweeps()
+    sw1, sweep_e, sweep_e_ts = sw_["sw1"], sw_["sweep_e"], sw_["sweep_e_ts"]
     liq_ok = bool(sw1) or sweep_e is not None
     _add(checks, "liquidity", "Liquidity sweep before the reaction", 3, liq_ok,
          (f"{'Sell-side' if d == BULL else 'Buy-side'} liquidity swept on {'1H' if sw1 else tf_e}" if liq_ok
@@ -647,7 +738,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         status, head = "low_agreement", f"Trigger present but agreement {agreement:.0f}% < {cfg.min_agreement:.0f}% minimum"
     else:
         status = "signal"
-        head = f"{'BUY' if d == BULL else 'SELL'} - {pattern['label']} in 1H {tapped['source']}"
+        head = f"{'Scalp ' if scalp else ''}{'BUY' if d == BULL else 'SELL'} - {pattern['label']} in 1H {tapped['source']}" \
+               + (f" ({len(conf)} confirmations)" if (cfg.ext_confirms and len(conf) > 1) else "")
 
     step_ok = [bias_ok, bias_ok, align_ok and zone_ok, pat_ok and (sess_pass or not sess_gate)]
     stage = 0
@@ -688,9 +780,12 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         "bias_4h": bias4, "bias_1h": bias1, "agreement": round(agreement, 1), "grade": grade,
         "gates_ok": gates_ok, "checks": checks, "entry": entry if zone_ok else None,
         "stop_loss": sl if zone_ok else None, "take_profit": tp if zone_ok else None,
-        "risk": risk if zone_ok else None, "rr": cfg.rr,
+        "risk": risk if zone_ok else None, "rr": rr_used,
         "tp_reason": tp_reason, "reward_r": round(abs(tp - price) / risk, 2) if (zone_ok and risk) else None,
         "breakeven_at_r": cfg.breakeven_at_r, "breakeven_price": breakeven_price,
+        "style": cfg.style, "trade_type": f"{'Scalp' if scalp else 'Swing'} {'BUY' if d == BULL else 'SELL'}" if bias_ok else None,
+        "confirmations": conf, "confirm_count": len(conf), "confirm_needed": need,
+        "patterns_seen": [p_["label"] for p_ in pats], "retest_entry": retest,
         "h1_preview": h1_preview, "one_h_preview": one_h_preview, "entry_shift_preview": entry_shift_preview,
         "counter_watch": counter_watch, "momentum": mom, "volatility": volr, "highlights": highlights,
         "candle_ts": t, "signal_time": t + cfg.entry_seconds, "candle_idx": i,
@@ -754,14 +849,161 @@ def forming_watch(be: Bars, forming: dict | None, latest: dict, d: int, entry_se
     }
 
 
+# -------------------------------------------------------------------- outlook: what to expect and WHEN
+# Price is not a martingale, but over the few hours that matter here it is close enough to give an honest,
+# explainable timing estimate: for a level `a` away and a per-bar volatility `sigma`, the time T to first touch
+# of a driftless random walk satisfies  P(T <= t) = 2 * (1 - Phi(a / (sigma * sqrt(t)))).  Solving for 25 / 50 / 75 %
+# gives  t = k * (a / sigma)^2  with k = 0.756 / 2.198 / 9.85.  (Trending markets arrive sooner, choppy ones later -
+# the numbers are a window, never a promise.)
+_ETA_K = {"p25": 0.756, "p50": 2.198, "p75": 9.85}
+
+
+def eta_window(distance: float, sigma_bar: float, start_ts: int, step: int, futures: bool) -> dict:
+    """Clock-time window in which price has a 25 / 50 / 75 % chance of having touched a level `distance` away."""
+    if distance <= 0:
+        return {"in_zone": True}
+    z2 = (distance / max(sigma_bar, 1e-12)) ** 2
+    out: dict = {"in_zone": False, "bars": {}}
+    for k, mult in _ETA_K.items():
+        bars = max(1, int(math.ceil(mult * z2)))
+        out["bars"][k] = bars
+        out[k + "_ts"] = _sessions.advance_open_time(start_ts, bars, step, futures)
+    return out
+
+
+def _bar_sigma(be: Bars, i: int, sess: np.ndarray | None = None, look: int = 300) -> float:
+    """Std-dev of one entry-timeframe bar's close-to-close change, measured over the hours when trading is allowed
+    (the quiet Asian hours would understate how fast the London / New York market moves)."""
+    lo = max(1, i - look)
+    d = np.diff(be.c[lo - 1:i + 1])
+    if sess is not None and len(sess) > i:
+        m = sess[lo:i + 1]
+        if m.sum() >= 40:
+            d = d[m[:len(d)]] if len(m) >= len(d) else d
+    return float(np.std(d)) if len(d) > 5 else float(be.atr[i]) * 0.6
+
+
+def _nearest_zone(zone_ctx, d: int, price: float, t: int) -> dict | None:
+    want = "demand" if d == BULL else "supply"
+    best, best_dist = None, None
+    for z in zone_ctx.zones + zone_ctx.fvgs:
+        if z["type"] != want or z["state"] == "broken" or z["formed_idx"] < zone_ctx.b.n - 220:
+            continue
+        if zone_ctx.b.t[min(z["formed_idx"], zone_ctx.b.n - 1)] > t:
+            continue
+        dist = max(0.0, price - z["top"]) if d == BULL else max(0.0, z["bottom"] - price)
+        if (d == BULL and price < z["bottom"]) or (d == BEAR and price > z["top"]):
+            continue                      # price already beyond the zone on the wrong side
+        key = (dist, 0 if z["source"] == "OB" else 1, -z["strength"])
+        if best is None or key < best_dist:
+            best, best_dist = z, key
+    return best
+
+
+def build_outlook(h4: "H4Ctx", h1: "H1Ctx", be: Bars, sess_mask: np.ndarray | None, latest: dict, cfg: Cfg,
+                  price: float, levels: list[dict], futures: bool, now_ts: int | None = None) -> dict:
+    """The 'what do I expect next, and when' block shown in the preview. Never fires a trade - it only describes
+    the plan for each side: which zone price has to reach, what has to happen there, where the trade would be
+    invalid, where it would target and the clock-time window in which it is likely to happen."""
+    now_ts = int(now_ts or time.time())
+    i = be.n - 1
+    step = cfg.entry_seconds
+    last_close = max(int(be.t[i]) + step, now_ts)   # a lagging feed must not put the window in the past
+    sigma = _bar_sigma(be, i, sess_mask)
+    a_e, a_1 = float(be.atr[i]), float(h1.b.atr[-1])
+    t_now = int(be.t[i])
+    sess_now = _sessions.trade_allowed_at(now_ts, futures)
+    # next candle close that can actually produce a trigger (a pattern needs a CLOSED bar)
+    next_close = last_close if last_close > now_ts else last_close + step * (1 + (now_ts - last_close) // step)
+    window_ts = now_ts if sess_now else _sessions.next_trade_window(now_ts, futures)
+
+    plans: list[dict] = []
+    dirs: list[tuple[int, str]] = []
+    primary = h4.trend if h4.trend != 0 else h1.trend
+    if primary != 0:
+        dirs = [(primary, "primary"), (-primary, "alternative")]
+    else:
+        dirs = [(BULL, "range"), (BEAR, "range")]
+
+    for dd, role in dirs:
+        zone = _nearest_zone(h1, dd, price, t_now)
+        buy = dd == BULL
+        pl: dict = {"direction": "BUY" if buy else "SELL", "role": role, "zone": None, "state": "no_zone"}
+        with_trend = (role == "primary") or (role == "range")
+        if zone is not None:
+            dist = max(0.0, price - zone["top"]) if buy else max(0.0, zone["bottom"] - price)
+            in_zone = dist == 0.0
+            pl["zone"] = zone_json(h1.b, zone)
+            pl["distance"] = dist
+            pl["distance_atr"] = round(dist / max(a_e, 1e-9), 2)
+            edge = zone["top"] if buy else zone["bottom"]
+            mid = (zone["top"] + zone["bottom"]) / 2.0
+            stop = (zone["bottom"] - 0.4 * a_e) if buy else (zone["top"] + 0.4 * a_e)
+            risk = max(abs(mid - stop), 0.6 * a_e)
+            rr_plan = min(cfg.rr, cfg.scalp_rr) if not with_trend else cfg.rr
+            tgt_dist, tgt_why = realistic_target(h1, h4, dd, mid, risk, rr_plan, levels)
+            pl["plan"] = {"entry_zone": [zone["bottom"], zone["top"]], "entry": mid, "stop": stop,
+                          "target": mid + tgt_dist if buy else mid - tgt_dist, "target_why": tgt_why,
+                          "risk": risk, "reward_r": round(tgt_dist / risk, 2)}
+            pl["eta"] = eta_window(dist, sigma, last_close, step, futures)
+            if in_zone:
+                pl["state"] = "in_zone"
+                pl["headline"] = (f"{pl['direction']}: price is INSIDE the 1H {zone['source']} - waiting for a closed "
+                                  f"{cfg.entry_interval} confirmation candle")
+            else:
+                pl["state"] = "waiting_zone"
+                pl["headline"] = (f"{pl['direction']}: wait for a pullback into the 1H {zone['source']} "
+                                  f"{zone['bottom']:.2f}-{zone['top']:.2f} ({pl['distance_atr']:.1f}x {cfg.entry_interval} ATR away)")
+            pl["trigger"] = (f"A closed {cfg.entry_interval} candle inside the zone showing engulfing / rejection / star / "
+                             f"tweezer / inside-bar / momentum, plus at least {latest.get('confirm_needed') or cfg.min_confirms} "
+                             f"more confirmation{'s' if (latest.get('confirm_needed') or cfg.min_confirms) > 1 else ''} "
+                             f"(mini-BOS, sweep, RSI turn, MACD turn, EMA reclaim or volume)")
+        else:
+            pl["headline"] = f"{pl['direction']}: no fresh 1H zone of the right type right now"
+        # where the idea is wrong
+        if role == "primary" and primary != 0:
+            lvl = h1.st["last_low"] if buy else h1.st["last_high"]
+            if lvl:
+                pl["invalidation"] = {"price": float(lvl["price"]),
+                                      "text": f"A 1H close {'below' if buy else 'above'} {lvl['price']:.2f} breaks the 1H structure "
+                                              f"- the {pl['direction']} idea is off and the opposite side takes over"}
+        elif role == "alternative":
+            pl["note"] = ("Counter-trend side: only a 1H structure break flips the bias, until then it is a short-term "
+                          "(scalp) idea at best")
+        pl["when"] = {"next_candle_close": next_close, "session_open_now": sess_now,
+                      "next_trade_window": window_ts}
+        plans.append(pl)
+
+    # one-line verdict for the preview header
+    lead = next((p_ for p_ in plans if p_["state"] in ("in_zone", "waiting_zone")), None)
+    verdict = {"kind": "none"}
+    if latest.get("direction") in ("BUY", "SELL"):
+        verdict = {"kind": "live", "direction": latest["direction"]}
+    elif lead:
+        eta = lead.get("eta") or {}
+        if eta.get("in_zone"):
+            verdict = {"kind": "in_zone", "direction": lead["direction"], "next_candle_close": next_close}
+        elif eta.get("p50_ts"):
+            verdict = {"kind": "eta", "direction": lead["direction"], "p25_ts": eta.get("p25_ts"),
+                       "p50_ts": eta.get("p50_ts"), "p75_ts": eta.get("p75_ts")}
+    return {"plans": plans, "verdict": verdict, "sigma_bar": sigma, "step": step, "now": now_ts,
+            "session_open_now": sess_now, "next_trade_window": window_ts,
+            "windows": _sessions.upcoming_windows(None, futures)[:6],
+            "bias": {"h4": bias_name(h4.trend), "h1": bias_name(h1.trend)}}
+
+
 # -------------------------------------------------------------------- live signal
+def make_ctx(df4: pd.DataFrame, df1: pd.DataFrame) -> tuple["H4Ctx", "H1Ctx"]:
+    return H4Ctx(df4), H1Ctx(df1)
+
+
 def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, cfg: Cfg,
                  levels: list[dict], sess_mask: np.ndarray, market_ok: bool, lookback: int = 3,
-                 forming_bar: dict | None = None) -> tuple[dict, dict]:
+                 forming_bar: dict | None = None, ctx: tuple | None = None, futures: bool = True) -> tuple[dict, dict]:
     """df_* must contain CLOSED bars only.  Returns (signal, analysis_for_chart).
     forming_bar (optional): {"Open","High","Low","Close"} of the entry-timeframe candle that is
     currently still open (not in df_entry) - used only for the informational 'forming' preview."""
-    h4, h1 = H4Ctx(df4), H1Ctx(df1)
+    h4, h1 = ctx if ctx else (H4Ctx(df4), H1Ctx(df1))
     be = Bars(df_entry.tail(400))
     sess = sess_mask[-be.n:]
     n = be.n
@@ -791,8 +1033,13 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
     sig["entry_price"] = sig.pop("entry", None)
     sig["risk_reward"] = cfg.rr
     sig["reason"] = " | ".join(f"{'OK' if c['ok'] else ('n/a' if c['ok'] is None else 'NO')}: {c['detail']}" for c in sig["checks"])
-    sig["forming"] = forming_watch(be, forming_bar, latest, h4.trend, cfg.entry_seconds)
+    sig["forming"] = forming_watch(be, forming_bar, latest, h4.trend if cfg.style != "scalp" else (h1.trend or h4.trend),
+                                   cfg.entry_seconds)
     sig["server_time"] = int(time.time())
+    try:
+        sig["outlook"] = build_outlook(h4, h1, be, sess, latest, cfg, price, levels, futures)
+    except Exception:  # noqa: BLE001 - the outlook is advisory; never let it break the signal
+        sig["outlook"] = None
 
     analysis = {
         "4h": tf_json(h4, price, "4h"),

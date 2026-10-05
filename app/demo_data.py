@@ -20,6 +20,10 @@ import pandas as pd
 START_PRICE = {
     "GC=F": 3350.0, "XAUUSD=X": 3335.0, "SI=F": 38.0,
     "EURUSD=X": 1.17, "GBPUSD=X": 1.35, "USDJPY=X": 147.0, "AUDUSD=X": 0.66,
+    "GBPNZD=X": 2.25, "EURAUD=X": 1.75, "NZDUSD=X": 0.60, "USDCAD=X": 1.37, "USDCHF=X": 0.80,
+    "EURGBP=X": 0.87, "EURJPY=X": 172.0, "GBPJPY=X": 198.0, "AUDJPY=X": 97.0, "NZDJPY=X": 88.0,
+    "EURNZD=X": 1.95, "GBPAUD=X": 2.05, "GBPCAD=X": 1.85, "AUDNZD=X": 1.10, "CADJPY=X": 107.0,
+    "EURCHF=X": 0.94, "XAGUSD=X": 38.0,
     "BTC-USD": 105000.0,
 }
 NO_VOLUME_SUFFIX = "=X"

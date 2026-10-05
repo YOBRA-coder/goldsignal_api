@@ -80,6 +80,14 @@ class SignalOut(BaseModel):
     risk_reward: Optional[float] = None
     outcome_price: Optional[float] = None
     outcome: Optional[str] = None
+    style: Optional[str] = None
+    trade_type: Optional[str] = None
+    current_sl: Optional[float] = None
+    be_moved: Optional[bool] = None
+    max_r: Optional[float] = None
+    min_r: Optional[float] = None
+    health: Optional[str] = None
+    health_note: Optional[str] = None
 
     @field_serializer("created_at", "closed_at")
     def _ser(self, v):
@@ -108,6 +116,7 @@ class ProfileStats(BaseModel):
     open_signals: int
     won: int
     lost: int
+    breakeven: int = 0
     win_rate: float
     net_r: float
     expired: int = 0
@@ -122,6 +131,7 @@ class BacktestRequest(BaseModel):
     min_agreement: float = 70.0
     sessions_only: bool = True
     breakeven_at_r: float = 1.0   # move stop to entry after this many R in favor; 0 disables it
+    style: Literal["swing", "scalp"] = "swing"
 
 
 class BacktestOut(BaseModel):

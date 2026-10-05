@@ -26,6 +26,7 @@ from . import sessions
 from .data_fetcher import INTERVAL_SECONDS, resample_ohlc
 from .strategy import Cfg, H1Ctx, H4Ctx, MIN_BARS, effective_min_agreement, evaluate_entry
 from .structure import Bars
+from .trades import can_open
 
 
 def summarize(trades: list[dict]) -> dict:
@@ -75,7 +76,8 @@ def _resample_1h(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_reward: float = 2.0,
                  min_agreement: float = 70.0, sessions_only: bool = True, symbol: str = "GC=F",
-                 df_1h: pd.DataFrame | None = None, breakeven_at_r: float = 1.0) -> dict:
+                 df_1h: pd.DataFrame | None = None, breakeven_at_r: float = 1.0, style: str = "swing",
+                 max_open: int = 1, **cfg_extra) -> dict:
     """df_1h: real hourly history (e.g. 180 days) used to build the 1H/4H context, exactly like the live
     engine.  Without it the 1H/4H bars are derived from the entry candles (only ~59 days of context).
     breakeven_at_r: once a trade is this many R in favor, its stop is moved to entry (a scratch instead
@@ -83,7 +85,7 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
     eff_min = effective_min_agreement(min_agreement, risk_reward, INTERVAL_SECONDS[entry_interval])
     cfg = Cfg(rr=risk_reward, min_agreement=eff_min, sessions_only=sessions_only,
               entry_seconds=INTERVAL_SECONDS[entry_interval], entry_interval=entry_interval,
-              breakeven_at_r=breakeven_at_r)
+              breakeven_at_r=breakeven_at_r, style=style, **cfg_extra)
     df1 = df_1h if df_1h is not None else _resample_1h(df_entry)
     df4 = resample_ohlc(df1, "4h", symbol)
     end1 = df1.index.as_unit("s").asi8 + 3600
@@ -93,29 +95,31 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
     sess = sessions.allowed_mask(df_entry.index)
 
     trades: list[dict] = []
-    open_t = None
+    open_ts: list[dict] = []
     c1 = c4 = -1
     h1 = h4 = None
+    scalp = style == "scalp"
     for i in range(30, n):
         T = int(be.t[i]) + cfg.entry_seconds  # close time of candle i
-        if open_t is not None:
-            hi, lo = be.h[i], be.l[i]
-            up = open_t["direction"] == "BUY"
-            # ---- protect a winner: move the stop to breakeven once price is far enough in our favor
-            if breakeven_at_r > 0 and not open_t["be_moved"]:
-                fav = (hi - open_t["entry"]) if up else (open_t["entry"] - lo)
-                if fav / max(open_t["risk0"], 1e-9) >= breakeven_at_r:
-                    open_t["sl"] = open_t["entry"]
-                    open_t["be_moved"] = True
-            hit_tp = hi >= open_t["tp"] if up else lo <= open_t["tp"]
-            hit_sl = lo <= open_t["sl"] if up else hi >= open_t["sl"]
-            if hit_tp or hit_sl:
+        hi, lo = be.h[i], be.l[i]
+        if open_ts:
+            still = []
+            for open_t in open_ts:
+                up = open_t["direction"] == "BUY"
+                # ---- protect a winner: move the stop to breakeven once price is far enough in our favor
+                if breakeven_at_r > 0 and not open_t["be_moved"]:
+                    fav = (hi - open_t["entry"]) if up else (open_t["entry"] - lo)
+                    if fav / max(open_t["risk0"], 1e-9) >= breakeven_at_r:
+                        open_t["sl"] = open_t["entry"]
+                        open_t["be_moved"] = True
+                hit_tp = hi >= open_t["tp"] if up else lo <= open_t["tp"]
+                hit_sl = lo <= open_t["sl"] if up else hi >= open_t["sl"]
+                if not (hit_tp or hit_sl):
+                    still.append(open_t)
+                    continue
                 if hit_tp and hit_sl:
                     # Both levels traded inside one candle - we don't actually know which came
-                    # first. Scoring this as an automatic loss (the old behaviour) is a pessimistic
-                    # bias that inflates the loss count on every timeframe, worst on fast ones where
-                    # SL/TP are close together and this case is common. Approximate instead: whichever
-                    # level the candle's open sat closer to needed less distance to be touched first.
+                    # first. Approximate: whichever level the candle's open sat closer to.
                     win = abs(be.o[i] - open_t["tp"]) <= abs(be.o[i] - open_t["sl"])
                 else:
                     win = hit_tp
@@ -128,7 +132,11 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
                 open_t.update(exit_ts=int(be.t[i]), result=result, r=round(r, 3),
                               exit_price=open_t["tp"] if win else open_t["sl"])
                 trades.append(open_t)
-                open_t = None
+            had = len(open_ts)
+            open_ts = still
+            if max_open <= 1 and had:      # single-trade mode: no new entry on the candle a trade closed / while one runs
+                continue
+        if len(open_ts) >= max_open:
             continue
 
         k1, k4 = int(np.searchsorted(end1, T, side="right")), int(np.searchsorted(end4, T, side="right"))
@@ -138,23 +146,37 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
             h1, c1 = H1Ctx(df1.iloc[:k1]), k1
         if k4 != c4:
             h4, c4 = H4Ctx(df4.iloc[:k4]), k4
-        if h4.trend == 0 or h1.trend != h4.trend:
+        if scalp:
+            if h1.trend == 0 or h1.trend == h4.trend:
+                continue
+        elif h4.trend == 0 or h1.trend != h4.trend:
             continue
         res = evaluate_entry(h4, h1, be, i, cfg, bool(sess[i]), True, [], fast=True)
         if res["direction"] in ("BUY", "SELL"):
-            tag = sessions.tag_sessions(df_entry.index[i:i + 1])[0]
-            open_t = {"entry_ts": int(be.t[i]), "direction": res["direction"], "entry": res["entry"],
-                      "sl": res["stop_loss"], "tp": res["take_profit"], "agreement": res["agreement"],
-                      "grade": res["grade"], "session": tag, "pattern": (res["pattern"] or {}).get("type"),
-                      "zone": (res["zone"] or {}).get("source"), "risk0": res["risk"],
-                      "reward_r": res.get("reward_r") or risk_reward, "be_moved": False}
-    if open_t is not None:
+            cand = {"entry_ts": int(be.t[i]), "direction": res["direction"], "entry": res["entry"],
+                    "sl": res["stop_loss"], "tp": res["take_profit"], "agreement": res["agreement"],
+                    "grade": res["grade"], "session": sessions.tag_sessions(df_entry.index[i:i + 1])[0],
+                    "pattern": (res["pattern"] or {}).get("type"),
+                    "zone": (res["zone"] or {}).get("source"), "risk0": res["risk"],
+                    "reward_r": res.get("reward_r") or risk_reward, "be_moved": False,
+                    "style": style, "trade_type": res.get("trade_type"), "confirms": res.get("confirm_count")}
+            if open_ts:
+                ok, _why = can_open([{"direction": t["direction"], "entry": t["entry"], "sl": t["sl"]} for t in open_ts],
+                                    {"direction": cand["direction"], "entry": cand["entry"], "sl": cand["sl"]},
+                                    max_open=max_open)
+                if not ok:
+                    continue
+            open_ts.append(cand)
+    for open_t in open_ts:
         open_t["result"] = "open"
         trades.append(open_t)
+    trades.sort(key=lambda t: t["entry_ts"])
 
-    out = summarize(trades)
+    closed_ = sorted((t for t in trades if t.get("result") in ("win", "loss", "breakeven")), key=lambda t: t["exit_ts"])
+    out = summarize(closed_ + [t for t in trades if t.get("result") == "open"])
     out["trades"] = trades
-    out["equity_ts"] = [int(be.t[30])] + [t["exit_ts"] for t in trades if t.get("result") in ("win", "loss", "breakeven")]
+    out["equity_ts"] = [int(be.t[30])] + [t["exit_ts"] for t in closed_]
+    out["style"], out["max_open"] = style, max_open
     out["bars"] = n
     out["htf_source"] = "real 1H history" if df_1h is not None else "derived from entry candles"
     out["min_agreement_requested"] = min_agreement

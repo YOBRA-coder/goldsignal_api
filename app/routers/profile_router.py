@@ -14,6 +14,7 @@ def me(db: Session = Depends(get_db), user: models.User = Depends(auth.get_curre
     lost = sum(1 for s in signals if s.status == "lost")
     open_ = sum(1 for s in signals if s.status == "open")
     expired = sum(1 for s in signals if s.status == "expired")
+    be = sum(1 for s in signals if s.status == "breakeven")
     closed = won + lost
     win_rate = (won / closed * 100) if closed else 0.0
     net_r = sum(s.result_r for s in signals if s.result_r is not None)
@@ -21,6 +22,6 @@ def me(db: Session = Depends(get_db), user: models.User = Depends(auth.get_curre
 
     return schemas.ProfileStats(
         user=user, total_signals=len(signals), open_signals=open_, expired=expired,
-        won=won, lost=lost, win_rate=round(win_rate, 2), net_r=round(net_r, 2),
+        won=won, lost=lost, breakeven=be, win_rate=round(win_rate, 2), net_r=round(net_r, 2),
         avg_agreement=round(sum(ag) / len(ag), 1) if ag else 0.0,
     )
