@@ -33,10 +33,11 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
-from . import settings
+from . import candle_store, sessions, settings
 
 log = logging.getLogger("goldsignal.data")
 
@@ -54,8 +55,10 @@ SUPPORTED = list(INTERVAL_SECONDS)
 
 # 1m is the "live tape": every other timeframe is patched with it (see merge_live), so the
 # slower frames can be cached longer without the newest candle ever lagging.
-DEFAULT_PERIOD = {"1m": "2d", "5m": "30d", "15m": "30d", "30m": "45d",
+DEFAULT_PERIOD = {"1m": "5d", "5m": "59d", "15m": "59d", "30m": "59d",
                   "1h": "365d", "1d": "2y", "1wk": "5y"}
+# the longest window Yahoo will serve per request - older history comes from candle_store (it accumulates)
+YF_MAX_DAYS = {"1m": 7, "5m": 59, "15m": 59, "30m": 59, "1h": 729, "1d": 7300, "1wk": 7300}
 TTL = {"1m": 12, "5m": 90, "15m": 120, "30m": 180, "1h": 300, "1d": 120, "1wk": 600}
 FAIL_COOLDOWN = 25  # seconds before retrying a failed download (doubles on every repeated failure, capped below)
 FAIL_COOLDOWN_MAX = 300
@@ -266,10 +269,26 @@ def _read_disk(path: str) -> pd.DataFrame | None:
         return None
 
 
-def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.DataFrame:
-    """Cached fetch of a native Yahoo interval (1m,5m,15m,30m,1h,1d,1wk)."""
+def _refresh_period(symbol: str, yf_interval: str, period: str | None) -> tuple[str, bool]:
+    """(period to download, is_default_request). Once the store holds recent history a short top-up is enough."""
+    custom = period is not None
     period = period or DEFAULT_PERIOD[yf_interval]
-    key = (symbol, yf_interval, period)
+    maxd = YF_MAX_DAYS.get(yf_interval, 365)
+    if period_days(period) > maxd:
+        period = f"{int(maxd)}d"                                   # Yahoo refuses more: the store supplies the rest
+    if not custom and not DEMO and yf_interval in ("5m", "15m", "30m", "1h"):
+        b = candle_store.bounds(symbol, yf_interval)
+        if b and b[2] > 150:
+            age = (time.time() - b[1]) / 86400.0
+            if age < 5:
+                period = f"{int(min(maxd, max(5, age + 3)))}d"       # top-up only; weekends are < 3 days
+    return period, not custom
+
+
+def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.DataFrame:
+    """Cached fetch of a native Yahoo interval (1m,5m,15m,30m,1h,1d,1wk), merged with the stored history."""
+    want = period or DEFAULT_PERIOD[yf_interval]
+    key = (symbol, yf_interval, want)
     ttl = TTL.get(yf_interval, 120)
 
     hit = _mem.get(key)
@@ -284,13 +303,26 @@ def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.Dat
         # ---- demo mode
         if DEMO:
             from .demo_data import demo_candles
-            df = demo_candles(symbol, yf_interval, period_days(period))
+            df = demo_candles(symbol, yf_interval, period_days(want))
             _mem[key] = (time.time(), df)
             _meta[key] = {"source": "demo", "fetched_at": int(time.time()), "stale": False}
             return df
 
+        def _stored(max_days: float | None) -> pd.DataFrame | None:
+            try:
+                st = candle_store.load(symbol, yf_interval,
+                                       since_ts=None if max_days is None else int(time.time() - max_days * 86400))
+                return st if len(st) else None
+            except Exception:  # noqa: BLE001
+                return None
+
         # ---- recently failed -> don't hammer Yahoo
-        stale = hit[1] if hit else _read_disk(_disk_path(symbol, yf_interval, period))
+        if hit:
+            stale = hit[1]
+        else:
+            stale = _stored(period_days(want) if period else None)
+            if stale is None:
+                stale = _read_disk(_disk_path(symbol, yf_interval, want))
         cool = _fail_until.get(key)
         if cool and time.time() < cool[0]:
             if stale is not None:
@@ -299,13 +331,22 @@ def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.Dat
             raise DataUnavailable(f"Data feed unavailable for {symbol} {yf_interval}", cool[1])
 
         try:
-            df, method, diag = _download(symbol, yf_interval, period)
+            dl_period, is_default = _refresh_period(symbol, yf_interval, period)
+            df, method, diag = _download(symbol, yf_interval, dl_period)
+            try:
+                candle_store.upsert(symbol, yf_interval, df)
+                df = candle_store.merge(df, symbol, yf_interval, None if is_default else period_days(want))
+            except Exception as e:  # noqa: BLE001 - storing is a bonus, never break the feed over it
+                log.warning("candle store failed: %s", e)
+            if not is_default:
+                cut = df.index[-1] - pd.Timedelta(days=period_days(want))
+                df = df[df.index >= cut]
             _mem[key] = (time.time(), df)
             _meta[key] = {"source": method, "fetched_at": int(time.time()), "stale": False}
             LAST_DIAGNOSTICS.update(ok=True, at=int(time.time()),
                                     detail=[f"{symbol} {yf_interval}: {method}"] + diag)
             try:
-                df.to_csv(_disk_path(symbol, yf_interval, period))
+                df.tail(20000).to_csv(_disk_path(symbol, yf_interval, want))
             except OSError:
                 pass
             _fail_until.pop(key, None)
@@ -362,16 +403,17 @@ def resample_ohlc(df: pd.DataFrame, rule: str, symbol: str = "GC=F") -> pd.DataF
 
 
 def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
-    """Patch a (cached, possibly minutes-old) frame with the live 1-minute tape so the newest
-    candle of EVERY timeframe keeps moving, and brand-new candles appear the moment they open.
+    """Patch a (cached, possibly minutes-old) frame with the live 1-minute tape so the newest candle of EVERY
+    timeframe keeps moving, and brand-new candles appear the moment they open.
 
-    Only the TAIL is touched (the last cached bar plus whatever the 1m tape covers since then) and
-    every rebuilt bar is cut on an EPOCH-aligned boundary (floor(unix_time / step) * step) - the same
-    grid Yahoo's own 5m/15m/30m/1h bars sit on. Bucketing relative to "the last cached bar's start"
-    instead of the epoch was the bug that made 1m/5m candles look slightly misaligned / jump on refresh:
-    if the cached base bar wasn't itself sitting exactly on a round boundary, every synthetic bar drifted
-    with it and snapped back the moment a fresh native fetch replaced the cache.
-    """
+    Only the TAIL is touched and every rebuilt bar is cut on an EPOCH-aligned boundary (floor(unix / step) * step)
+    - the grid Yahoo's own 5m/15m/30m/1h bars sit on.
+
+    v4 fix for the "gaps / wrong candles on 30m and below" bug: the old version REPLACED the last cached candle with
+    one rebuilt from whatever 1-minute bars happened to be available. Yahoo's 1m feed has holes, so that candle came
+    out too short (a bar missing its open, a clipped wick) and the next refresh snapped it back - gaps and jumping
+    candles. Now an existing candle is only EXTENDED by the tape: its open stays, its high/low can only grow, and
+    only its close follows the latest price. A candle is rebuilt from the tape alone only when it is brand new."""
     if interval == "1m" or base.empty:
         return base
     try:
@@ -381,29 +423,130 @@ def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
     if m1.empty:
         return base
     step = INTERVAL_SECONDS[interval]
-    df = base.copy()
-    last_start = df.index[-1]
-    # Only rebuild from one bar back (safety margin in case the cached last bar was itself partial) -
-    # never touches older history, so this stays cheap even with a 2-day 1m tape.
-    window_start = last_start - timedelta(seconds=step)
-    seg = m1[m1.index >= window_start]
+    last_start = base.index[-1]
+    seg = m1[m1.index >= last_start]                     # the tape from the start of the newest cached candle
     if seg.empty:
-        return df
-
+        return base
     secs = seg.index.as_unit("s").asi8
     bucket = (secs // step) * step
     g = seg.assign(_k=bucket).groupby("_k")
-    new_bars = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
-                             "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
-    new_bars.index = pd.to_datetime(new_bars.index, unit="s", utc=True)
-    new_bars.index.name = "time"
-    if new_bars.empty:
-        return df
+    tape = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
+                         "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
+    tape.index = pd.to_datetime(tape.index, unit="s", utc=True)
+    tape.index.name = "time"
+    if tape.empty:
+        return base
 
-    cutoff = new_bars.index.min()
-    df = pd.concat([df[df.index < cutoff], new_bars]).sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
+    df = base.copy()
+    newest = tape.index.max()
+    for ts in tape.index.intersection(df.index):        # extend, never shrink, a candle we already have
+        t = tape.loc[ts]
+        row = df.loc[ts]
+        df.loc[ts, "High"] = max(row["High"], t["High"])
+        df.loc[ts, "Low"] = min(row["Low"], t["Low"])
+        df.loc[ts, "Volume"] = max(row["Volume"], t["Volume"])
+        if ts == newest:                                 # only the newest bucket's close follows the latest price
+            df.loc[ts, "Close"] = t["Close"]
+    new = tape[~tape.index.isin(df.index) & (tape.index > df.index[-1])]
+    if len(new):
+        df = pd.concat([df, new]).sort_index()
+    return df[~df.index.duplicated(keep="last")]
+
+
+# ------------------------------------------------------------------ candle hygiene
+def clean_candles(df: pd.DataFrame, interval: str, futures: bool = True, max_fill: int = 12,
+                  smooth_open: bool | None = None, info: dict | None = None) -> pd.DataFrame:
+    """Make intraday candles chart-safe and analysis-safe. Applied to EVERY consumer (chart, signals, backtest)
+    so what you see is what the engine analysed.
+
+      1. align      every candle onto the epoch grid of its timeframe (5m -> :00 :05 ..., 30m -> :00 :30); candles
+                    that land in the same slot are merged (open of the first, high/low extremes, close of the last)
+      2. integrity  high >= max(open, close), low <= min(open, close)  (some feeds print bars that violate it)
+      3. fill       a bar MISSING from the middle of an open market (Yahoo omits bars with no prints) is inserted as a
+                    flat candle at the previous close, volume 0, so the series has no holes and the bar-count windows
+                    the engine uses keep meaning the same real time. Only when the whole gap is inside open-market
+                    hours and <= max_fill bars; weekends / the daily break are never filled.
+      4. continuity (<= 30m only) when a candle opens a hair away from the previous close inside one continuous
+                    session, the open snaps to the previous close - the way MetaTrader draws it - so the chart has no
+                    fake micro-gaps. A real gap (> 0.5 x typical range) is left alone.
+    `info` (optional dict) is filled with what was changed."""
+    if df is None or df.empty or interval in ("4h", "1d", "1w", "1wk"):
+        return df
+    step = INTERVAL_SECONDS.get(interval) or INTERVAL_SECONDS[{"1wk": "1w"}.get(interval, interval)]
+    info = info if info is not None else {}
+    info.update(aligned=0, merged=0, fixed=0, filled=0, gaps=[])
+    if smooth_open is None:
+        smooth_open = step <= 1800
+    out = df
+    secs = out.index.as_unit("s").asi8
+
+    # 1. align (sub-hour frames; 1h bars keep Yahoo's own start)
+    if step < 3600:
+        grid = (secs // step) * step
+        moved = grid != secs
+        if moved.any() or (np.diff(grid) == 0).any():
+            info["aligned"] = int(moved.sum())
+            g = out.assign(_k=grid).groupby("_k", sort=True)
+            info["merged"] = int(len(out) - len(g))
+            out = pd.DataFrame({"Open": g["Open"].first(), "High": g["High"].max(), "Low": g["Low"].min(),
+                                "Close": g["Close"].last(), "Volume": g["Volume"].sum()})
+            out.index = pd.to_datetime(out.index, unit="s", utc=True)
+            out.index.name = "time"
+            secs = out.index.as_unit("s").asi8
+    if len(out) < 3:
+        return out
+
+    # 2. integrity
+    o, h, l, c = (out[k].to_numpy(float).copy() for k in ("Open", "High", "Low", "Close"))
+    h2, l2 = np.maximum.reduce([o, h, l, c]), np.minimum.reduce([o, h, l, c])
+    bad = (h2 != h) | (l2 != l)
+    if bad.any():
+        info["fixed"] = int(bad.sum())
+        out = out.copy()
+        out["High"], out["Low"] = h2, l2
+        h, l = h2, l2
+    v = out["Volume"].to_numpy(float).copy()
+
+    # 3. fill holes inside open markets
+    delta = np.diff(secs)
+    holes = np.nonzero((delta > step) & (delta % step == 0))[0]
+    if len(holes):
+        add_t, add_p = [], []
+        for k in holes:
+            n_missing = int(delta[k] // step) - 1
+            miss = secs[k] + step * np.arange(1, n_missing + 1)
+            idx = pd.to_datetime(miss, unit="s", utc=True)
+            if not sessions.market_open_mask(idx, futures).all():
+                continue                                         # weekend / daily break inside: a REAL gap
+            if n_missing > max_fill:
+                info["gaps"].append({"from": int(miss[0]), "to": int(miss[-1]), "bars": n_missing})
+                continue
+            add_t.extend(miss.tolist())
+            add_p.extend([float(c[k])] * n_missing)
+        if add_t:
+            info["filled"] = len(add_t)
+            flat = pd.DataFrame({"Open": add_p, "High": add_p, "Low": add_p, "Close": add_p, "Volume": 0.0},
+                                index=pd.to_datetime(add_t, unit="s", utc=True))
+            flat.index.name = "time"
+            out = pd.concat([out, flat]).sort_index()
+            secs = out.index.as_unit("s").asi8
+            o, h, l, c, v = (out[k].to_numpy(float).copy() for k in ("Open", "High", "Low", "Close", "Volume"))
+
+    # 4. open = previous close inside one continuous run of candles
+    if smooth_open and len(out) > 60:
+        adj = np.diff(secs) == step
+        gap = o[1:] - c[:-1]
+        rng = pd.Series(h - l).rolling(50, min_periods=10).median().to_numpy()[:-1]
+        snap = adj & (np.abs(gap) > 0) & (np.abs(gap) <= 0.5 * np.nan_to_num(rng, nan=0.0))
+        if snap.any():
+            o2 = o.copy()
+            o2[1:][snap] = c[:-1][snap]
+            h = np.maximum(h, o2)
+            l = np.minimum(l, o2)
+            out = out.copy()
+            out["Open"], out["High"], out["Low"] = o2, h, l
+            info["smoothed"] = int(snap.sum())
+    return out
 
 
 def _candles(symbol: str, interval: str, period: str | None, live: bool) -> pd.DataFrame:
@@ -423,6 +566,8 @@ def get_candles(symbol: str, interval: str = "15m", period: str | None = None, l
     if interval not in INTERVAL_SECONDS:
         raise DataUnavailable(f"Unsupported timeframe '{interval}'")
     df = _candles(symbol, interval, period, live and period is None)
+    if interval in ("1m", "5m", "15m", "30m", "1h"):
+        df = clean_candles(df, interval, is_futures(symbol), smooth_open=None if interval != "1h" else False)
     off = settings.offset(symbol)
     if off:
         df = df.copy()

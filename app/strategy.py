@@ -66,6 +66,14 @@ def effective_min_agreement(base: float, rr: float, entry_seconds: int = _REF_SE
     return max(35.0, min(92.0, out))
 
 
+def min_agreement_for(base: float, rr: float, entry_seconds: int, style: str = "swing", sens: str = "normal") -> float:
+    """The agreement % a setup needs, for this style / sensitivity. ONE definition shared by live, replay and backtest."""
+    v = effective_min_agreement(base, min(rr, 1.5) if style == "scalp" else rr, entry_seconds)
+    if sens == "high":
+        v -= 6.0                      # most signals: also accepts setups a few checks short of the full picture
+    return max(35.0, v)
+
+
 @dataclass
 class Cfg:
     rr: float = 2.0
@@ -85,6 +93,31 @@ class Cfg:
     fvg_extra: bool = False      # a gap-only zone tap must be backed by one more confirmation than an order block
     scalp_rr: float = 1.5        # scalps aim for a nearer target
     max_open: int = 3            # concurrent trades per symbol (live tracker + backtest)
+    # ---- v4: entry finding. How many entry-TF bars back a zone touch still counts (scaled for 5m/1m), and
+    # whether the entry timeframe's OWN order blocks / FVGs may be used as extra tap zones next to the 1H ones.
+    tap_bars: int = 5
+    local_zones: bool = False
+    sens: str = "normal"         # label only: strict | normal | high (see engine_flags)
+
+
+def engine_flags(style: str = "swing", sens: str = "normal") -> dict:
+    """The ONE place that decides which engine switches a run uses. The live scanner, the chart replay and the
+    backtest all call this, so a backtest means exactly what the live signal means.
+
+    strict : the original (v3) behaviour - engulfing / pin-bar only, mini-BOS or volume as the only backing.
+    normal : (default) every trigger candle + every confirmation the engine knows, zone touch counts for 8 bars.
+    high   : normal + the entry timeframe's own OB/FVG as extra zones - the most signals, for 5m/15m hunting.
+    scalp  : always uses the wide set (a short-term trade needs more ways to qualify, it asks for more backing
+             instead when it trades against the 4H).
+    """
+    base = dict(no_chase=True, min_confirms=1, fvg_extra=False)
+    if style == "scalp":
+        return {**base, "ext_patterns": True, "ext_confirms": True, "tap_bars": 8, "local_zones": True, "sens": sens}
+    if sens == "strict":
+        return {**base, "ext_patterns": False, "ext_confirms": False, "tap_bars": 5, "local_zones": False, "sens": "strict"}
+    if sens == "high":
+        return {**base, "ext_patterns": True, "ext_confirms": True, "tap_bars": 10, "local_zones": True, "sens": "high"}
+    return {**base, "ext_patterns": True, "ext_confirms": True, "tap_bars": 8, "local_zones": False, "sens": "normal"}
 
 
 # ------------------------------------------------------------------- contexts
@@ -325,6 +358,44 @@ def _sub_bars(b: Bars, lo: int, hi: int) -> Bars:
     return s
 
 
+def _first_tap(cands: list[dict], be: Bars, i: int, d: int, lo_i: int, formed_before: bool = False,
+               off: int = 0) -> tuple[dict | None, int | None]:
+    """First candidate zone (order blocks first, then strongest) that price touched in bars lo_i..i while the
+    closed bar i is still on the right side of it. formed_before: the zone must have existed before it was touched
+    (needed for zones cut from the entry timeframe itself; `off` maps their bar index onto be's index)."""
+    for z in sorted(cands, key=lambda q: (0 if q["source"] == "OB" else 1, -q["strength"])):
+        if d == BULL:
+            hit = (be.l[lo_i:i + 1] <= z["top"]) & (be.h[lo_i:i + 1] >= z["bottom"])
+            valid = be.c[i] >= z["bottom"]
+        else:
+            hit = (be.h[lo_i:i + 1] >= z["bottom"]) & (be.l[lo_i:i + 1] <= z["top"])
+            valid = be.c[i] <= z["top"]
+        if not (hit.any() and valid):
+            continue
+        tap = lo_i + int(np.argmax(hit))
+        if formed_before and z["formed_idx"] + off >= tap:
+            # formed on / after the touch: take the first touch that comes AFTER it was formed, if there is one
+            later = np.nonzero(hit)[0]
+            later = [lo_i + int(k) for k in later if lo_i + int(k) > z["formed_idx"] + off]
+            if not later:
+                continue
+            tap = later[0]
+        return z, tap
+    return None, None
+
+
+def _local_zones(be: Bars, i: int, want: str, span: int = 260) -> tuple[Bars, list[dict]] | None:
+    """Order blocks + fair-value gaps of the ENTRY timeframe itself (bars <= i only), of the type `want`."""
+    lo = max(0, i + 1 - span)
+    if i + 1 - lo < 60:
+        return None
+    sb = _sub_bars(be, lo, i + 1)
+    st = analyze_structure(sb, 2, 2)
+    zs = zones_from_events(sb, st["events"], min_leg_atr=1.0) + find_fvgs(sb, 120)
+    out = [z for z in zs if z["type"] == want and z["state"] != "broken" and z["formed_idx"] < sb.n - 2]
+    return (sb, out) if out else None
+
+
 def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bool, market_ok: bool = True,
                    levels: list | None = None, fast: bool = False) -> dict:
     """Evaluate the whole rule-set on closed entry-TF candle `i` (uses data <= i only)."""
@@ -333,7 +404,11 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     # swing = classic top-down (4H sets the direction, 1H must agree).
     # scalp = 1H-led: 1H has a direction of its own that 4H has NOT confirmed (neutral or opposite) - a
     #         shorter-term trade, so it targets a nearer level and needs more confirmation.
-    d = (h1.trend if (h1.trend != 0 and h1.trend != h4.trend) else 0) if scalp else h4.trend
+    # v4: a scalp follows the 1H (falling back to the 4H when the 1H has no direction). It used to fire ONLY when
+    # 1H and 4H disagreed - a rare situation - which is why scalp mode produced almost nothing, even in a backtest.
+    # Agreeing with the 4H is the best scalp; fighting it is allowed but must be backed by one more confirmation.
+    d = (h1.trend if h1.trend != 0 else h4.trend) if scalp else h4.trend
+    against_htf = bool(scalp and h4.trend != 0 and d != 0 and h4.trend != d)
     bias4, bias1 = bias_name(h4.trend), bias_name(h1.trend)
     price, t = float(be.c[i]), int(be.t[i])
     a_e, a_1, a_4 = float(be.atr[i]), float(h1.b.atr[-1]), float(h4.b.atr[-1])
@@ -345,9 +420,11 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     # ---- STEP 1: 4H direction
     bias_ok = d != 0
     if scalp:
-        _add(checks, "bias_4h", "1H leads while 4H has not confirmed (short-term trade)", 1, bias_ok,
-             (f"1H is {bias1.upper()} while 4H is {bias4.upper()} - scalp only, nearer target" if bias_ok
-              else "1H has no direction of its own against 4H - no scalp"), 2.0, True, "1H")
+        _add(checks, "bias_4h", "1H (or 4H) gives the scalp a direction", 1, bias_ok,
+             ((f"1H is {bias1.upper()}, 4H is {bias4.upper()} - " + ("with the bigger trend" if not against_htf
+                                                                        else "against the 4H, needs extra backing")
+               + ", nearer target") if bias_ok
+              else "Neither 1H nor 4H has a direction - no scalp"), 2.0, True, "1H")
     else:
         _add(checks, "bias_4h", "4H structure sets direction", 1, bias_ok,
              f"4H is {bias4.upper()}" + (f" ({'HH/HL' if d == BULL else 'LH/LL'}, {h4.st['run']} break(s) in a row)" if bias_ok
@@ -367,21 +444,24 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
             if z["type"] == want and z["state"] != "broken" and z["formed_idx"] >= h1.b.n - 220 \
                     and h1.b.t[min(z["formed_idx"], h1.b.n - 1)] <= t:
                 cands.append(z)
-    tapped, tap_idx = None, None
-    lo_i = max(0, i - _tf_scale(cfg.entry_seconds, 5))
-    for z in sorted(cands, key=lambda q: (0 if q["source"] == "OB" else 1, -q["strength"])):
-        if d == BULL:
-            hit = (be.l[lo_i:i + 1] <= z["top"]) & (be.h[lo_i:i + 1] >= z["bottom"])
-            valid = be.c[i] >= z["bottom"]
-        else:
-            hit = (be.h[lo_i:i + 1] >= z["bottom"]) & (be.l[lo_i:i + 1] <= z["top"])
-            valid = be.c[i] <= z["top"]
-        if hit.any() and valid:
-            tapped, tap_idx = z, lo_i + int(np.argmax(hit))
-            break
+    lo_i = max(0, i - _tf_scale(cfg.entry_seconds, cfg.tap_bars))
+    tapped, tap_idx = (_first_tap(cands, be, i, d, lo_i) if bias_ok else (None, None))
+    zbars, ztf = h1.b, "1H"
+    # v4: no 1H zone touched - the entry timeframe's own order blocks / gaps may count (scalps and "high" sensitivity).
+    # Computed lazily and only when this bar already shows a trigger candle, so a backtest stays fast.
+    if tapped is None and bias_ok and cfg.local_zones and \
+            (cf.candle_patterns(be, i, d) if cfg.ext_patterns else candle_pattern(be, i, d)):
+        lz = _local_zones(be, i, want)
+        if lz:
+            lb, lcands = lz
+            off = i + 1 - lb.n
+            ltap, lti = _first_tap(lcands, be, i, d, lo_i, formed_before=True, off=off)
+            if ltap is not None:
+                tapped, tap_idx, zbars, ztf = ltap, lti, lb, tf_e
+                cands = cands + [ltap]
     zone_ok = tapped is not None
     if zone_ok:
-        zdet = f"Price tapped 1H {'demand' if d == BULL else 'supply'} {tapped['source']} " \
+        zdet = f"Price tapped {ztf} {'demand' if d == BULL else 'supply'} {tapped['source']} " \
                f"{tapped['bottom']:.2f}-{tapped['top']:.2f} ({tapped['state']})"
     elif cands:
         near = min(cands, key=lambda z: abs((z["top"] + z["bottom"]) / 2 - price))
@@ -459,8 +539,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     need = cfg.min_confirms
     if cfg.fvg_extra and tapped is not None and tapped["source"] == "FVG":
         need += 1                      # a gap-only tap is the weaker zone: ask for one more reason
-    if scalp:
-        need += 1                      # short-term trade against the 4H: ask for one more reason
+    if against_htf:
+        need += 1                      # a scalp that fights the 4H must be backed by one more reason
     confluence_ok = bool(pat_ok and len(conf) >= need)
     _add(checks, "confluence", (f"At least {need} independent confirmation{'s' if need > 1 else ''} behind the trigger candle"
                                 if cfg.ext_confirms or need > 1 else
@@ -554,7 +634,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         h1_preview = {
             "would_be_direction": "BUY" if d == BULL else "SELL",
             "zone_tapped": zone_ok, "trigger_ready": pat_ok,
-            "zone": zone_json(h1.b, tapped) if tapped else None,
+            "zone": {**zone_json(zbars, tapped), "tf": ztf} if tapped else None,
             "pattern": pattern["label"] if pattern else None,
             "entry": entry, "stop_loss": sl, "take_profit": tp, "tp_reason": tp_reason,
             "note": (f"4H is {bias4} and the {tf_e} setup is "
@@ -617,7 +697,11 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
 
     gates_ok = all(c["ok"] for c in checks if c["gate"])
     if fast and not gates_ok:
-        return {"direction": "WAIT", "gates_ok": False}
+        # `blocked_by` / zone_ok / pat_ok let the chart replay show a near-miss ("zone tapped + trigger, but ...")
+        blk = next((c["key"] for c in checks if c["gate"] and not c["ok"]), None)
+        return {"direction": "WAIT", "gates_ok": False, "blocked_by": blk, "zone_ok": zone_ok, "pat_ok": pat_ok,
+                "d": d, "candle_ts": t, "price": price, "pattern": ({**pattern, "ts": t} if pattern else None),
+                "zone": ({**zone_json(zbars, tapped), "tf": ztf} if tapped else None)}
 
     # ---- STEP 2: 4H map (soft checks)
     price_zone = None
@@ -729,16 +813,22 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     elif not zone_ok:
         status, head = "waiting_zone", zdet
     elif not pat_ok:
-        status, head = "waiting_trigger", f"Inside 1H zone - waiting for {sign} engulfing / rejection on {tf_e}"
+        status, head = "waiting_trigger", f"Inside {ztf} zone - waiting for a {sign} trigger candle on {tf_e}"
     elif sess_gate and not sess_pass:
         status, head = "out_of_session", "Setup ready but outside London / New York"
     elif not risk_ok:
         status, head = "risk_too_wide", "Setup found but the stop would be too wide"
+    elif not gates_ok:
+        # a mandatory gate the headline chain above does not name (anti-chase RSI, or too little backing behind the
+        # trigger candle) - say THAT, not "low agreement" (the old text blamed the score even when the score was fine)
+        bad = next(c for c in checks if c["gate"] and not c["ok"])
+        status = "stretched" if bad["key"] == "extension" else "needs_confirmation" if bad["key"] == "confluence" else "blocked"
+        head = f"Trigger present but blocked: {bad['detail']}"
     elif not fired:
-        status, head = "low_agreement", f"Trigger present but agreement {agreement:.0f}% < {cfg.min_agreement:.0f}% minimum"
+        status, head = "low_agreement", f"Trigger present but agreement {agreement:.1f}% < {cfg.min_agreement:.1f}% minimum"
     else:
         status = "signal"
-        head = f"{'Scalp ' if scalp else ''}{'BUY' if d == BULL else 'SELL'} - {pattern['label']} in 1H {tapped['source']}" \
+        head = f"{'Scalp ' if scalp else ''}{'BUY' if d == BULL else 'SELL'} - {pattern['label']} in {ztf} {tapped['source']}" \
                + (f" ({len(conf)} confirmations)" if (cfg.ext_confirms and len(conf) > 1) else "")
 
     step_ok = [bias_ok, bias_ok, align_ok and zone_ok, pat_ok and (sess_pass or not sess_gate)]
@@ -789,7 +879,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         "h1_preview": h1_preview, "one_h_preview": one_h_preview, "entry_shift_preview": entry_shift_preview,
         "counter_watch": counter_watch, "momentum": mom, "volatility": volr, "highlights": highlights,
         "candle_ts": t, "signal_time": t + cfg.entry_seconds, "candle_idx": i,
-        "zone": zone_json(h1.b, tapped) if tapped else None, "watch_zone": watch,
+        "d": d, "zone_ok": zone_ok, "pat_ok": pat_ok, "zone_tf": ztf if zone_ok else None,
+        "zone": {**zone_json(zbars, tapped), "tf": ztf} if tapped else None, "watch_zone": watch,
         "pattern": ({**pattern, "ts": t} if pattern else None),
         "mini_bos": ({"level": bos["level"], "ts": int(be.t[bos["idx"]]), "level_ts": int(be.t[bos["level_idx"]])} if bos else None),
         "volume": ({"ratio": vs["ratio"], "spike": vs["spike"], "ts": t} if vs else None),
@@ -1065,6 +1156,50 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
         "highlights": sig.get("highlights"),
     }
     return sig, analysis
+
+
+# -------------------------------------------------------------------- catch-up scan
+def scan_missed(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, cfg: Cfg, levels: list[dict],
+                sess_mask: np.ndarray, market_ok: bool, since_ts: int, max_bars: int = 96,
+                latest_ctx: tuple | None = None) -> list[dict]:
+    """Evaluate EVERY closed entry candle after `since_ts` (not just the newest few) and return the ones that fired.
+
+    The live endpoint is polled, not event driven: a trigger that printed while the page was closed, or between two
+    polls, was never evaluated again once it slid out of the 3-bar look-back - which is how "a lot of signals" went
+    missing and only previews were left. This walks every candle since the last scan.
+    Each bar is judged with the 1H / 4H picture AS IT WAS when that candle closed (same rule as the backtest)."""
+    be = Bars(df_entry.tail(500))
+    n = be.n
+    sess = sess_mask[-n:]
+    end1 = df1.index.as_unit("s").asi8 + 3600
+    end4 = df4.index.as_unit("s").asi8 + 14400
+    c1 = c4 = -1
+    h1 = h4 = None
+    out: list[dict] = []
+    for i in range(max(30, n - max_bars), n):
+        if int(be.t[i]) <= since_ts:
+            continue
+        T = int(be.t[i]) + cfg.entry_seconds
+        k1, k4 = int(np.searchsorted(end1, T, side="right")), int(np.searchsorted(end4, T, side="right"))
+        if k1 < MIN_BARS["1h"] or k4 < MIN_BARS["4h"]:
+            continue
+        if latest_ctx and k1 == len(df1) and k4 == len(df4):
+            h4, h1, c1, c4 = latest_ctx[0], latest_ctx[1], k1, k4
+        else:
+            if k1 != c1:
+                h1, c1 = H1Ctx(df1.iloc[:k1]), k1
+            if k4 != c4:
+                h4, c4 = H4Ctx(df4.iloc[:k4]), k4
+        scalp = cfg.style == "scalp"
+        if (h1.trend == 0 and h4.trend == 0) if scalp else (h4.trend == 0 or h1.trend != h4.trend):
+            continue
+        res = evaluate_entry(h4, h1, be, i, cfg, bool(sess[i]), market_ok if i == n - 1 else True, levels)
+        if res["direction"] in ("BUY", "SELL"):
+            res["age_bars"] = n - 1 - i
+            d = 1 if res["direction"] == "BUY" else -1
+            res["moved_r"] = float(be.c[-1] - res["entry"]) * d / max(res["risk"], 1e-9)
+            out.append(res)
+    return out
 
 
 def own_structure(df: pd.DataFrame, tf: str) -> dict | None:

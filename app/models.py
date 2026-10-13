@@ -68,6 +68,10 @@ class SignalRecord(Base):
     plan_json = Column(Text, nullable=True)         # zone, confirmations, biases at entry (the "thesis")
     events_json = Column(Text, nullable=True)       # timeline: breakeven, warnings, exit
 
+    # --- added in v4 (auto-migrated)
+    missed = Column(Boolean, nullable=True)         # found by the catch-up scan AFTER it had already resolved (no alerts)
+    sens = Column(String, nullable=True)            # strict / normal / high engine sensitivity it was found with
+
     owner = relationship("User", back_populates="signals")
 
 
@@ -153,3 +157,23 @@ class BacktestRun(Base):
     stats_json = Column(Text, nullable=True)   # profit factor, drawdown, per-session breakdown, params
 
     owner = relationship("User", back_populates="backtests")
+
+
+class ScanState(Base):
+    """What the scanner has already looked at, per user + pair + entry timeframe + style. It lets every scan
+    evaluate EVERY candle that closed since the last one (not just the last few), keeps the scanning going while the
+    browser is closed (params are remembered for the background scanner) and stops setup alerts from repeating."""
+    __tablename__ = "scan_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    symbol = Column(String, index=True)
+    entry_interval = Column(String)
+    style = Column(String, default="swing")
+    last_bar_ts = Column(Integer, nullable=True)     # open time of the newest candle that was already evaluated
+    last_status = Column(String, nullable=True)
+    last_dir = Column(String, nullable=True)
+    last_setup_ts = Column(Integer, nullable=True)   # when the last "setup forming" alert went out
+    params_json = Column(Text, nullable=True)        # rr / min_agreement / sessions_only / sens / scalp of the last scan
+    updated_at = Column(DateTime, default=utcnow)
+    seen_at = Column(DateTime, default=utcnow)       # last time a PAGE asked (the background scanner keeps going 3 days)

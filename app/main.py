@@ -30,6 +30,12 @@ app.include_router(backtest_router.router)
 app.include_router(profile_router.router)
 
 
+@app.on_event("startup")
+def _start_background_scanner():
+    from . import bg_scanner
+    bg_scanner.start()
+
+
 @app.get("/")
 def root():
     from .data_fetcher import DEMO

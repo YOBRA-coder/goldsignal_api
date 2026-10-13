@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import List, Literal
@@ -21,6 +23,7 @@ from ..levels import key_levels
 from ..models import utcnow
 from ..structure import Bars
 
+log = logging.getLogger("goldsignal.scan")
 router = APIRouter(prefix="/signals", tags=["signals"])
 
 EXPIRE_HOURS = 72  # open signals older than this are closed as "expired"
@@ -198,18 +201,18 @@ def _rec_out(rec: models.SignalRecord, snap: dict | None = None) -> dict:
 
 
 # ------------------------------------------------------------------------- live
-# One place that decides which of the new engine switches the live signal AND the backtest use.
-LIVE_FLAGS = dict(no_chase=True, min_confirms=1, ext_patterns=False, ext_confirms=False, fvg_extra=False)
+# One place that decides which engine switches the live signal, the chart replay AND the backtest use.
+LIVE_FLAGS = strat.engine_flags("swing", "strict")      # the v3 behaviour (kept for scripts); live default is "normal"
+_SCAN_LOCK = threading.RLock()                           # the page and the background scanner must not double-record
+CATCHUP_HOURS = 6                                        # how far back one scan looks for triggers it has not seen
 
 
 def _make_cfg(style: str, rr: float, min_agreement: float, sessions_only: bool, entry_interval: str,
-              breakeven_at_r: float) -> strat.Cfg:
-    scalp = style == "scalp"
-    rr_eff = min(rr, 1.5) if scalp else rr
-    eff_min = effective_min_agreement(min_agreement, rr_eff, INTERVAL_SECONDS[entry_interval])
-    return strat.Cfg(rr=rr, min_agreement=eff_min, sessions_only=sessions_only,
-                     entry_seconds=INTERVAL_SECONDS[entry_interval], entry_interval=entry_interval,
-                     breakeven_at_r=breakeven_at_r, style=style, **LIVE_FLAGS)
+              breakeven_at_r: float, sens: str = "normal") -> strat.Cfg:
+    step = INTERVAL_SECONDS[entry_interval]
+    return strat.Cfg(rr=rr, min_agreement=strat.min_agreement_for(min_agreement, rr, step, style, sens),
+                     sessions_only=sessions_only, entry_seconds=step, entry_interval=entry_interval,
+                     breakeven_at_r=breakeven_at_r, style=style, **strat.engine_flags(style, sens))
 
 
 def _plan_json(sig: dict) -> str:
@@ -220,25 +223,84 @@ def _plan_json(sig: dict) -> str:
         "highlights": sig.get("highlights"), "retest_entry": sig.get("retest_entry")}, default=str)
 
 
-@router.get("/live")
-def live_signal(
-    symbol: str = "GC=F",
-    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
-    min_agreement: float = Query(70, ge=0, le=100),
-    sessions_only: bool = True,
-    rr: float = Query(2.0, ge=0.5, le=10),
-    breakeven_at_r: float = Query(1.0, ge=0, le=5),
-    scalp: bool = False,
-    persist: bool = True,
-    db: Session = Depends(get_db),
-    user: models.User = Depends(auth.get_current_user),
-):
+def _state(db: Session, user: models.User, symbol: str, interval: str, style: str) -> models.ScanState:
+    st = db.query(models.ScanState).filter(
+        models.ScanState.user_id == user.id, models.ScanState.symbol == symbol,
+        models.ScanState.entry_interval == interval, models.ScanState.style == style).first()
+    if st is None:
+        st = models.ScanState(user_id=user.id, symbol=symbol, entry_interval=interval, style=style)
+        db.add(st)
+        db.flush()
+    return st
+
+
+def _peek_outcome(symbol: str, cand: dict, step: int) -> dict | None:
+    """Has a trigger that fired a while ago already hit its target / stop? (replayed on the 5m candles)"""
     try:
-        raw4 = get_candles(symbol, "4h")
-        raw1 = get_candles(symbol, "1h")
-        rawe = get_candles(symbol, entry_interval)
-    except DataUnavailable as e:
-        raise unavailable(e)
+        df = get_candles(symbol, "5m")
+    except DataUnavailable:
+        return None
+    td = {"direction": cand["direction"], "entry": cand["entry_price"], "sl": cand["stop_loss"],
+          "tp": cand["take_profit"], "start_ts": int(cand["candle_ts"]) + step}
+    return trades.replay(td, df.index.as_unit("s").asi8, df["Open"].to_numpy(float), df["High"].to_numpy(float),
+                         df["Low"].to_numpy(float), df["Close"].to_numpy(float), be_at=1.0)
+
+
+def _record(db: Session, user: models.User, symbol: str, entry_interval: str, cand: dict, sess_label: str,
+            rr: float, sens: str, st: dict | None = None, caught_up: int = 0) -> models.SignalRecord:
+    rec = models.SignalRecord(
+        user_id=user.id, symbol=symbol, direction=cand["direction"], bias_4h=cand["bias_4h"],
+        entry_price=cand["entry_price"], stop_loss=cand["stop_loss"], take_profit=cand["take_profit"],
+        confidence=cand["confidence"], reason=cand["reason"], status="open",
+        entry_interval=entry_interval, trigger_ts=cand["candle_ts"], agreement=cand["agreement"],
+        grade=cand["grade"], session_label=sess_label, risk_reward=cand.get("rr", rr),
+        checks_json=json.dumps(cand["checks"]), style=cand.get("style"), trade_type=cand.get("trade_type"),
+        current_sl=cand["stop_loss"], be_moved=False, max_r=0.0, min_r=0.0, plan_json=_plan_json(cand), sens=sens,
+        events_json=json.dumps([{"ts": cand["signal_time"], "kind": "open",
+                                 "text": f"{cand.get('trade_type') or cand['direction']} opened at {cand['entry_price']:.5g}"
+                                         + (f" (found {caught_up} candle{'s' if caught_up != 1 else ''} late by the catch-up scan)"
+                                            if caught_up else "")}]))
+    if st is not None and st["status"] in ("won", "lost", "breakeven"):
+        # it had ALREADY resolved by the time the scan saw it: keep it for the record / the chart, raise no alert
+        rec.status, rec.result_r, rec.outcome_price = st["status"], st["result_r"], st["outcome_price"]
+        rec.closed_at, rec.outcome, rec.missed = _to_dt(st["closed_ts"]), "auto", True
+        rec.be_moved, rec.current_sl, rec.max_r, rec.min_r = st["be_moved"], st["current_sl"], st["max_r"], st["min_r"]
+        rec.events_json = json.dumps(_jload(rec.events_json, []) + st["events"])
+    return rec
+
+
+def _setup_alert(db: Session, user: models.User, symbol: str, entry_interval: str, style: str, sig: dict,
+                 state: models.ScanState, step: int) -> None:
+    """'A zone was just tapped, a trigger is pending' - the heads-up between "nothing" and "signal", sent once per
+    setup (not on every poll), so a preview no longer has to be noticed on the dashboard to be useful."""
+    if sig.get("status") != "waiting_trigger" or not sig.get("trade_type"):
+        state.last_status = sig.get("status")
+        return
+    now = int(time.time())
+    side = sig["trade_type"].split()[-1]
+    fresh = state.last_status != "waiting_trigger" or state.last_dir != side
+    cooled = not state.last_setup_ts or now - state.last_setup_ts > 6 * step
+    state.last_status, state.last_dir = "waiting_trigger", side
+    if not (fresh and cooled):
+        return
+    z = sig.get("zone") or {}
+    zt = f" in {z.get('tf', '1H')} {z.get('source', 'zone')} {z['bottom']:.5g}-{z['top']:.5g}" if z.get("top") else ""
+    db.add(models.Alert(
+        user_id=user.id, kind="setup", symbol=symbol,
+        title=f"SETUP forming - {style.title()} {side} {symbol}",
+        message=f"Price tapped a zone{zt}. Waiting for a {side.lower()} trigger candle on {entry_interval} - "
+                f"watch the next candle close. {sig.get('headline', '')}"))
+    state.last_setup_ts = now
+
+
+def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interval: str = "15m",
+             min_agreement: float = 70, sessions_only: bool = True, rr: float = 2.0, breakeven_at_r: float = 1.0,
+             scalp: bool = False, sens: str = "normal", persist: bool = True, background: bool = False) -> dict:
+    """One full evaluation of a pair. Called by the page (/signals/live) and by the background scanner.
+    Raises DataUnavailable when the feed is down."""
+    raw4 = get_candles(symbol, "4h")
+    raw1 = get_candles(symbol, "1h")
+    rawe = get_candles(symbol, entry_interval)
 
     d4, d1, de = (drop_incomplete(raw4, "4h"), drop_incomplete(raw1, "1h"), drop_incomplete(rawe, entry_interval))
     if len(d4) < strat.MIN_BARS["4h"] or len(d1) < strat.MIN_BARS["1h"] or len(de) < strat.MIN_BARS["entry"]:
@@ -264,16 +326,17 @@ def live_signal(
     market_ok = status["market_open"] and not status["stale"]
     sess_mask = sessions.allowed_mask(de.index)
     ctx = strat.make_ctx(d4, d1)            # built once, shared by the swing and the scalp evaluation
+    step = INTERVAL_SECONDS[entry_interval]
 
-    cfg = _make_cfg("swing", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r)
+    cfg = _make_cfg("swing", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens)
     sig, analysis = strat.build_signal(d4, d1, de, cfg, levels, sess_mask, market_ok, forming_bar=forming_bar,
                                        ctx=ctx, futures=futures)
     sig["min_agreement_requested"] = min_agreement
     sig["min_agreement_effective"] = round(cfg.min_agreement, 1)
 
-    scalp_sig = None
+    scalp_sig = scfg = None
     if scalp:
-        scfg = _make_cfg("scalp", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r)
+        scfg = _make_cfg("scalp", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens)
         scalp_sig, _ = strat.build_signal(d4, d1, de, scfg, levels, sess_mask, market_ok, ctx=ctx, futures=futures)
         scalp_sig["min_agreement_effective"] = round(scfg.min_agreement, 1)
     if not market_ok:
@@ -310,7 +373,7 @@ def live_signal(
     except Exception:  # noqa: BLE001 - the scan log is diagnostic only, never block the live endpoint on it
         db.rollback()
 
-    # ---- track every running trade (TP / SL / breakeven / health), then add a fresh one if this scan produced it
+    # ---- track every running trade (TP / SL / breakeven / health), then add fresh ones this scan produced
     newly_closed, snaps = [], []
     try:
         newly_closed, snaps = track_open(db, user)
@@ -318,54 +381,94 @@ def live_signal(
         db.rollback()
 
     record_ids: list[int] = []
+    caught_ids: list[int] = []
     skipped: list[str] = []
+    scan_info = {"since": None, "bars": 0, "caught_up": 0}
     if persist and market_ok:
-        for cand in (sig, scalp_sig):
-            if not cand or cand["direction"] not in ("BUY", "SELL"):
-                continue
-            if db.query(models.SignalRecord.id).filter(
-                    models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
-                    models.SignalRecord.trigger_ts == cand["candle_ts"],
-                    models.SignalRecord.style == cand.get("style")).first():
-                continue                                             # this exact candle was already recorded
-            running = db.query(models.SignalRecord).filter(
-                models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
-                models.SignalRecord.status == "open").all()
-            ok, why = trades.can_open(
-                [{"direction": r_.direction, "entry": r_.entry_price, "plan": _jload(r_.plan_json, {})} for r_ in running],
-                {"direction": cand["direction"], "entry": cand["entry_price"], "sl": cand["stop_loss"], "zone": cand.get("zone")},
-                MAX_OPEN_PER_SYMBOL)
-            if not ok:
-                skipped.append(why)
-                continue
-            note = ""
-            opp = [r_ for r_ in running if r_.direction != cand["direction"]]
-            if opp:
-                note = f" (note: you also have an open {opp[0].direction} on this pair)"
-            rec = models.SignalRecord(
-                user_id=user.id, symbol=symbol, direction=cand["direction"], bias_4h=cand["bias_4h"],
-                entry_price=cand["entry_price"], stop_loss=cand["stop_loss"], take_profit=cand["take_profit"],
-                confidence=cand["confidence"], reason=cand["reason"], status="open",
-                entry_interval=entry_interval, trigger_ts=cand["candle_ts"], agreement=cand["agreement"],
-                grade=cand["grade"], session_label=sess["label"], risk_reward=cand.get("rr", rr),
-                checks_json=json.dumps(cand["checks"]), style=cand.get("style"), trade_type=cand.get("trade_type"),
-                current_sl=cand["stop_loss"], be_moved=False, max_r=0.0, min_r=0.0, plan_json=_plan_json(cand),
-                events_json=json.dumps([{"ts": cand["signal_time"], "kind": "open",
-                                         "text": f"{cand.get('trade_type') or cand['direction']} opened at {cand['entry_price']:.5g}"}]))
-            db.add(rec)
-            db.flush()
-            db.add(models.Alert(
-                user_id=user.id, kind="signal", symbol=symbol, signal_id=rec.id,
-                title=f"{cand.get('trade_type') or cand['direction']} signal - {symbol}",
-                message=f"{cand['headline']} | entry {cand['entry_price']:.5g}  SL {cand['stop_loss']:.5g}  "
-                        f"TP {cand['take_profit']:.5g} | agreement {cand['agreement']:.0f}% ({cand['grade']}){note}"))
-            db.commit()
-            record_ids.append(rec.id)
-        if record_ids:
-            try:
-                _, snaps = track_open(db, user)
-            except Exception:  # noqa: BLE001
-                db.rollback()
+        with _SCAN_LOCK:
+            latest_ts = int(de.index.as_unit("s").asi8[-1])
+            cands: dict[tuple, dict] = {}
+            pairs = [("swing", cfg, sig)] + ([("scalp", scfg, scalp_sig)] if scalp else [])
+            for style, c_, live_sig in pairs:
+                try:
+                    state = _state(db, user, symbol, entry_interval, style)
+                    since = state.last_bar_ts or (latest_ts - strat._tf_scale(step, 12) * step)
+                    since = max(since, latest_ts - CATCHUP_HOURS * 3600)
+                    scan_info["since"] = since
+                    missed = strat.scan_missed(d4, d1, de, c_, levels, sess_mask, market_ok, since,
+                                               max_bars=int(CATCHUP_HOURS * 3600 / step) + 2, latest_ctx=ctx)
+                    scan_info["bars"] += len(de[de.index.as_unit("s").asi8 > since])
+                    for m_ in missed:
+                        m_.update(entry_price=m_.pop("entry"), confidence=m_["agreement"] / 100.0, bias_4h=strat.bias_name(ctx[0].trend),
+                                  reason=" | ".join(f"{'OK' if c['ok'] else ('n/a' if c['ok'] is None else 'NO')}: {c['detail']}"
+                                                    for c in m_["checks"]))
+                        m_["style"] = style
+                        cands[(style, m_["candle_ts"])] = m_
+                    if live_sig and live_sig["direction"] in ("BUY", "SELL"):
+                        cands[(style, live_sig["candle_ts"])] = live_sig          # the live view wins on the same candle
+                    _setup_alert(db, user, symbol, entry_interval, style, live_sig or {}, state, step)
+                    state.last_bar_ts = latest_ts
+                    state.params_json = json.dumps({"min_agreement": min_agreement, "sessions_only": sessions_only, "rr": rr,
+                                                    "breakeven_at_r": breakeven_at_r, "scalp": scalp, "sens": sens})
+                    state.updated_at = utcnow()
+                    if not background:
+                        state.seen_at = utcnow()
+                    db.commit()
+                except Exception:  # noqa: BLE001 - scanning bookkeeping must never hide the live signal
+                    log.exception("scan state failed")
+                    db.rollback()
+
+            for (style, ts_), cand in sorted(cands.items(), key=lambda kv: kv[0][1]):
+                if db.query(models.SignalRecord.id).filter(
+                        models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
+                        models.SignalRecord.entry_interval == entry_interval,
+                        models.SignalRecord.trigger_ts == cand["candle_ts"],
+                        models.SignalRecord.style == cand.get("style")).first():
+                    continue                                             # this exact candle was already recorded
+                age = int(cand.get("age_bars", 0) or 0)
+                st = _peek_outcome(symbol, cand, step) if age > 0 else None
+                resolved = bool(st and st["status"] in ("won", "lost", "breakeven"))
+                if not resolved:
+                    running = db.query(models.SignalRecord).filter(
+                        models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
+                        models.SignalRecord.status == "open").all()
+                    ok, why = trades.can_open(
+                        [{"direction": r_.direction, "entry": r_.entry_price, "plan": _jload(r_.plan_json, {})} for r_ in running],
+                        {"direction": cand["direction"], "entry": cand["entry_price"], "sl": cand["stop_loss"], "zone": cand.get("zone")},
+                        MAX_OPEN_PER_SYMBOL)
+                    if not ok:
+                        skipped.append(why)
+                        continue
+                    moved = float(cand.get("moved_r", 0.0))
+                    if not (-1.0 < moved < 1.0) and age > 0:
+                        continue                                         # it already ran away from the entry: not actionable
+                note = ""
+                if not resolved:
+                    opp = [r_ for r_ in db.query(models.SignalRecord).filter(
+                        models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
+                        models.SignalRecord.status == "open").all() if r_.direction != cand["direction"]]
+                    if opp:
+                        note = f" (note: you also have an open {opp[0].direction} on this pair)"
+                rec = _record(db, user, symbol, entry_interval, cand, sess["label"], rr, sens, st if resolved else None, age)
+                db.add(rec)
+                db.flush()
+                if not resolved:
+                    late = f" [caught {age} candle{'s' if age != 1 else ''} late - still valid]" if age > 0 else ""
+                    db.add(models.Alert(
+                        user_id=user.id, kind="signal", symbol=symbol, signal_id=rec.id,
+                        title=f"{cand.get('trade_type') or cand['direction']} signal - {symbol}",
+                        message=f"{cand['headline']} | entry {cand['entry_price']:.5g}  SL {cand['stop_loss']:.5g}  "
+                                f"TP {cand['take_profit']:.5g} | agreement {cand['agreement']:.0f}% ({cand['grade']}){note}{late}"))
+                    record_ids.append(rec.id)
+                if age > 0:
+                    caught_ids.append(rec.id)
+                db.commit()
+            scan_info["caught_up"] = len(caught_ids)
+            if record_ids:
+                try:
+                    _, snaps = track_open(db, user)
+                except Exception:  # noqa: BLE001
+                    db.rollback()
 
     snap_by_id = {sn["id"]: sn for sn in snaps}
     open_recs = db.query(models.SignalRecord).filter(
@@ -385,6 +488,8 @@ def live_signal(
         "analysis": analysis,
         "record_id": record_ids[0] if record_ids else None,
         "record_ids": record_ids,
+        "caught_up_ids": caught_ids,
+        "scan": scan_info,
         "skipped": skipped,
         "active_signal": active_here[0] if active_here else None,
         "active_signals": active_here,
@@ -394,6 +499,87 @@ def live_signal(
         "data": status,
         "updated_at": int(datetime.now(timezone.utc).timestamp()),
     }
+
+
+@router.get("/live")
+def live_signal(
+    symbol: str = "GC=F",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
+    min_agreement: float = Query(70, ge=0, le=100),
+    sessions_only: bool = True,
+    rr: float = Query(2.0, ge=0.5, le=10),
+    breakeven_at_r: float = Query(1.0, ge=0, le=5),
+    scalp: bool = False,
+    sens: Literal["strict", "normal", "high"] = "normal",
+    persist: bool = True,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    try:
+        return run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, breakeven_at_r, scalp, sens, persist)
+    except DataUnavailable as e:
+        raise unavailable(e)
+
+
+# ---------------------------------------------------------------------- replay (scroll-back signals)
+_REPLAY_CACHE: dict[tuple, tuple[float, dict]] = {}
+
+
+def _slim_trade(t: dict, style: str) -> dict:
+    keys = ("entry_ts", "direction", "entry", "sl", "tp", "agreement", "grade", "pattern", "zone", "zone_tf", "result",
+            "r", "exit_ts", "exit_price", "be_moved", "reward_r", "confirmations", "headline", "trade_type", "max_r")
+    return {**{k: t.get(k) for k in keys}, "style": style}
+
+
+@router.get("/replay")
+def replay_signals(
+    symbol: str = "GC=F",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
+    style: Literal["swing", "scalp", "both"] = "swing",
+    sens: Literal["strict", "normal", "high"] = "normal",
+    min_agreement: float = Query(70, ge=0, le=100),
+    sessions_only: bool = True,
+    rr: float = Query(2.0, ge=0.5, le=10),
+    days: int = Query(14, ge=1, le=365),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """What the engine WOULD have said on every candle of the last `days` days, with how each signal went.
+
+    Same engine, same switches and same trade rules as the live scanner (entry = the signal candle's close, trades
+    resolved by the live tracker's own replay), run over the stored candle history. This is what puts the signals AND
+    the near-misses (zone touched / trigger printed but a rule stopped it) on the chart when you scroll back."""
+    from .. import backtest as bt
+    try:
+        df = drop_incomplete(get_candles(symbol, entry_interval), entry_interval)
+        df1 = drop_incomplete(get_candles(symbol, "1h"), "1h")
+    except DataUnavailable as e:
+        raise unavailable(e)
+    if len(df) < 120 or len(df1) < strat.MIN_BARS["1h"]:
+        return {"signals": [], "previews": [], "from_ts": None, "to_ts": None, "bars": 0}
+    last_ts = int(df.index.as_unit("s").asi8[-1])
+    key = (symbol, entry_interval, style, sens, round(rr, 2), round(min_agreement), sessions_only, days, last_ts)
+    hit = _REPLAY_CACHE.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    step = INTERVAL_SECONDS[entry_interval]
+    from_ts = last_ts - days * 86400
+    warm = 80
+    ts = df.index.as_unit("s").asi8
+    lo = max(0, int(np.searchsorted(ts, from_ts)) - warm)
+    sub = df.iloc[lo:]
+    sig_out, prev_out, summaries = [], [], {}
+    for st_ in (["swing", "scalp"] if style == "both" else [style]):
+        res = bt.run_backtest(sub, entry_interval, rr, min_agreement, sessions_only, symbol, df1, 1.0, style=st_,
+                              max_open=3 if st_ == "swing" else 2, fill="close", collect_previews=True, sens=sens)
+        sig_out += [_slim_trade(t, st_) for t in res["trades"] if t["entry_ts"] >= from_ts]
+        prev_out += [{**p_, "style": st_} for p_ in res.get("previews", []) if p_["ts"] >= from_ts]
+        summaries[st_] = {k: res[k] for k in ("total_trades", "wins", "losses", "breakevens", "win_rate", "net_r", "avg_r")}
+    out = {"signals": sorted(sig_out, key=lambda x: x["entry_ts"]), "previews": sorted(prev_out, key=lambda x: x["ts"]),
+           "from_ts": from_ts, "to_ts": last_ts, "bars": int(len(sub)), "summary": summaries, "sens": sens}
+    if len(_REPLAY_CACHE) > 40:
+        _REPLAY_CACHE.clear()
+    _REPLAY_CACHE[key] = (time.time(), out)
+    return out
 
 
 # ---------------------------------------------------------------------- scan log

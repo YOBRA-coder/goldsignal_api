@@ -33,21 +33,27 @@ def _503(e: DataUnavailable) -> HTTPException:
 def candles(
     symbol: str = "GC=F",
     interval: TF = "15m",
-    limit: int = Query(500, ge=50, le=1500),
+    limit: int = Query(1000, ge=50, le=5000),
+    before: int | None = Query(None, description="epoch seconds: return the `limit` candles that closed BEFORE this time (scroll-back paging)"),
     structure: bool = True,
     user: models.User = Depends(auth.get_current_user),
 ):
+    """Candles for the chart. History comes from the persistent candle store merged with the live feed, so the further
+    back you scroll the more there is (use `before` to page backwards; `has_more` says whether older candles exist)."""
     try:
         full = get_candles(symbol, interval)
     except DataUnavailable as e:
         raise _503(e)
     struct = None
-    if structure:
+    if structure and before is None:
         try:  # structure of THIS timeframe (BOS/CHoCH, zones, liquidity...) from closed bars
             struct = own_structure(drop_incomplete(full, interval), interval)
         except Exception:  # noqa: BLE001
             struct = None
-    df = full.tail(limit)
+    all_t = full.index.as_unit("s").asi8
+    end = len(full) if before is None else int(np.searchsorted(all_t, int(before), side="left"))
+    start = max(0, end - limit)
+    df = full.iloc[start:end]
     times = df.index.as_unit("s").asi8
     intraday = INTERVAL_SECONDS[interval] < 86400
     tags = sessions.tag_sessions(df.index) if intraday else None
@@ -58,8 +64,16 @@ def candles(
         if tags:
             r["session"] = tags[k]
         rows.append(r)
-    return {"symbol": symbol, "interval": interval, "candles": rows, "data": data_status(symbol, interval, df),
-            "has_volume": bool(np.nansum(v[-80:]) > 0), "structure": struct}
+    return {"symbol": symbol, "interval": interval, "candles": rows, "data": data_status(symbol, interval, full),
+            "has_volume": bool(np.nansum(v[-80:]) > 0), "structure": struct,
+            "has_more": start > 0, "total": int(len(full)), "first_ts": int(all_t[0]) if len(all_t) else None}
+
+
+@router.get("/store")
+def store_stats(symbol: str = "GC=F", user: models.User = Depends(auth.get_current_user)):
+    """How much candle history is stored for this pair (it grows as the app runs)."""
+    from .. import candle_store
+    return {"symbol": symbol, "series": candle_store.stats(symbol)}
 
 
 _WATCH_CACHE: dict = {}

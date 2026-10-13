@@ -1,32 +1,36 @@
 """
 Walk-forward backtest of the exact same rule-set the live engine uses.
 
-No look-ahead:
-  * 1H / 4H bars are built from the entry-timeframe data and a higher-timeframe
-    bar is only visible once it has fully CLOSED (bar end <= close of the current
-    entry candle).
-  * Signals are evaluated on closed entry candles only; the trade is entered at
-    that candle's close and managed from the NEXT candle on.
-  * Once a trade is `breakeven_at_r` R in favor, its stop moves to entry (see run_backtest) - a
-    losing candle after that scores a "breakeven" scratch (r=0), not a full loss.
-  * If SL and TP are both touched inside one candle, the winner is approximated by which level the
-    candle's open was closer to (see run_backtest) instead of always scoring it a loss.
-  * The take-profit itself is not always the blind risk_reward*risk distance - evaluate_entry aims it
-    at the nearest real opposing level when one sits closer (see strategy.realistic_target), so a
-    winning trade's `r` can be less than risk_reward (never more).
-Spread / slippage / commission are not modelled.  The daily/weekly key levels are
-not used (they need data the entry frame does not contain).
+v4 - "make it real". The old backtest said things the live app would never have said, for four reasons, all fixed:
+
+  1. SAME ENGINE SWITCHES.  The live scanner, the chart replay and this file all take their switches from
+     strategy.engine_flags(style, sens), so "strict / normal / high" and scalp mean the same thing everywhere.
+  2. SAME MAP.  The live engine aims take-profits at the daily / weekly levels (PDH / PDL / PWH / PWL) and scores
+     "room to the next obstacle" with them. The old backtest passed an empty level list, so its targets and its
+     agreement score differed from live. Point-in-time levels are rebuilt here from the 1H history (only days /
+     weeks that had fully CLOSED by the signal candle are used - no look-ahead).
+  3. SAME TRADE RULES.  Every trade is resolved with trades.replay(), the function the live tracker uses: breakeven
+     at +1R, and a candle that spans BOTH the stop and the target is booked as the STOP (conservative). The old
+     backtest guessed the winner from where the candle opened, which flattered the results.
+  4. REAL FILLS.  A signal is known when its candle CLOSES, so the order can only be filled on the next candle:
+     entry = next candle's open (not the close you could never trade). Spread / slippage are charged in R. A fill
+     that has already run away from the signal (> half a risk unit) or past the target is skipped as "missed".
+
+No look-ahead: 1H / 4H bars are only visible once fully closed; signals are evaluated on closed entry candles.
+The stored candle history (see candle_store) means the test can now run over months instead of the last ~30 days.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from . import sessions
+from . import sessions, trades as _tr
 from .data_fetcher import INTERVAL_SECONDS, resample_ohlc
-from .strategy import Cfg, H1Ctx, H4Ctx, MIN_BARS, effective_min_agreement, evaluate_entry
+from .strategy import Cfg, H1Ctx, H4Ctx, MIN_BARS, _tf_scale, engine_flags, evaluate_entry, min_agreement_for
 from .structure import Bars
 from .trades import can_open
+
+EXPIRE_SECONDS = 72 * 3600   # same as the live tracker: a trade that neither hit TP nor SL in 72 h is "expired"
 
 
 def summarize(trades: list[dict]) -> dict:
@@ -35,7 +39,7 @@ def summarize(trades: list[dict]) -> dict:
     losses = [t for t in closed if t["result"] == "loss"]
     breakevens = [t for t in closed if t["result"] == "breakeven"]
     net = sum(t["r"] for t in closed)
-    gp, gl = sum(t["r"] for t in wins), -sum(t["r"] for t in losses)
+    gp, gl = sum(t["r"] for t in closed if t["r"] > 0), -sum(t["r"] for t in closed if t["r"] < 0)
     eq, peak, mdd, cur = [0.0], 0.0, 0.0, 0.0
     best_streak = worst_streak = streak = 0
     for t in closed:
@@ -74,18 +78,56 @@ def _resample_1h(df: pd.DataFrame) -> pd.DataFrame:
             .dropna(subset=["Open", "Close"]))
 
 
+class _Levels:
+    """Point-in-time PDH / PDL / PWH / PWL (the only kinds the engine uses) from the 1H history."""
+
+    def __init__(self, df1: pd.DataFrame, symbol: str):
+        self.empty = df1 is None or len(df1) < 30
+        if self.empty:
+            return
+        d, w = resample_ohlc(df1, "1d", symbol), resample_ohlc(df1, "1w", symbol)
+        self.d_end = d.index.as_unit("s").asi8 + 86400
+        self.w_end = w.index.as_unit("s").asi8 + 604800
+        self.d_hi, self.d_lo = d["High"].to_numpy(float), d["Low"].to_numpy(float)
+        self.w_hi, self.w_lo = w["High"].to_numpy(float), w["Low"].to_numpy(float)
+        self._k = (-1, -1)
+        self._v: list[dict] = []
+
+    def at(self, T: int) -> list[dict]:
+        if self.empty:
+            return []
+        kd = int(np.searchsorted(self.d_end, T, side="right")) - 1     # last fully closed day
+        kw = int(np.searchsorted(self.w_end, T, side="right")) - 1
+        if (kd, kw) != self._k:
+            v = []
+            if kd >= 0:
+                v += [{"key": "PDH", "label": "PDH", "price": float(self.d_hi[kd]), "kind": "daily"},
+                      {"key": "PDL", "label": "PDL", "price": float(self.d_lo[kd]), "kind": "daily"}]
+            if kw >= 0:
+                v += [{"key": "PWH", "label": "PWH", "price": float(self.w_hi[kw]), "kind": "weekly"},
+                      {"key": "PWL", "label": "PWL", "price": float(self.w_lo[kw]), "kind": "weekly"}]
+            self._k, self._v = (kd, kw), v
+        return self._v
+
+
 def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_reward: float = 2.0,
                  min_agreement: float = 70.0, sessions_only: bool = True, symbol: str = "GC=F",
                  df_1h: pd.DataFrame | None = None, breakeven_at_r: float = 1.0, style: str = "swing",
-                 max_open: int = 1, **cfg_extra) -> dict:
-    """df_1h: real hourly history (e.g. 180 days) used to build the 1H/4H context, exactly like the live
-    engine.  Without it the 1H/4H bars are derived from the entry candles (only ~59 days of context).
-    breakeven_at_r: once a trade is this many R in favor, its stop is moved to entry (a scratch instead
-    of a full loss if price comes back) - set to 0 to disable and trade with a static stop."""
-    eff_min = effective_min_agreement(min_agreement, risk_reward, INTERVAL_SECONDS[entry_interval])
-    cfg = Cfg(rr=risk_reward, min_agreement=eff_min, sessions_only=sessions_only,
-              entry_seconds=INTERVAL_SECONDS[entry_interval], entry_interval=entry_interval,
-              breakeven_at_r=breakeven_at_r, style=style, **cfg_extra)
+                 max_open: int = 1, spread: float = 0.0, slippage: float = 0.0, fill: str = "next_open",
+                 collect_previews: bool = False, **cfg_extra) -> dict:
+    """df_1h: real hourly history used to build the 1H/4H context, exactly like the live engine. Without it the
+    1H/4H bars are derived from the entry candles.
+    breakeven_at_r: once a trade is this many R in favor, its stop moves to entry (0 disables it).
+    spread / slippage: price units (e.g. 0.30 for gold). Total cost per trade = spread + 2*slippage, charged in R.
+    fill: "next_open" (default, realistic) or "close" (the live tracker's own convention: entry = signal close).
+    collect_previews: also return the near-misses / zone taps the engine saw (used by the chart replay).
+    cfg_extra: engine switches (see strategy.engine_flags); `sens` picks strict / normal / high."""
+    step = INTERVAL_SECONDS[entry_interval]
+    sens = cfg_extra.pop("sens", "normal")
+    flags = {**engine_flags(style, sens), **cfg_extra}
+    eff_min = min_agreement_for(min_agreement, risk_reward, step, style, flags.get("sens", sens))
+    cfg = Cfg(rr=risk_reward, min_agreement=eff_min, sessions_only=sessions_only, entry_seconds=step,
+              entry_interval=entry_interval, breakeven_at_r=breakeven_at_r, style=style, **flags)
     df1 = df_1h if df_1h is not None else _resample_1h(df_entry)
     df4 = resample_ohlc(df1, "4h", symbol)
     end1 = df1.index.as_unit("s").asi8 + 3600
@@ -93,50 +135,35 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
     be = Bars(df_entry)
     n = be.n
     sess = sessions.allowed_mask(df_entry.index)
+    lv = _Levels(df1, symbol)
+    ts_arr = be.t
+    o_arr, h_arr, l_arr, c_arr = be.o, be.h, be.l, be.c
+    tags = sessions.tag_sessions(df_entry.index)
 
     trades: list[dict] = []
-    open_ts: list[dict] = []
+    previews: list[dict] = []
+    skipped = {"missed_fill": 0, "overlap": 0}
+    open_ts: list[dict] = []            # trades whose exit is still ahead of the current candle
     c1 = c4 = -1
     h1 = h4 = None
     scalp = style == "scalp"
+    cost_price = spread + 2.0 * slippage
+    last_prev: dict[tuple, int] = {}
     for i in range(30, n):
-        T = int(be.t[i]) + cfg.entry_seconds  # close time of candle i
-        hi, lo = be.h[i], be.l[i]
+        T = int(ts_arr[i]) + step  # close time of candle i
+        t_open = int(ts_arr[i])
+        had_close = False
         if open_ts:
             still = []
-            for open_t in open_ts:
-                up = open_t["direction"] == "BUY"
-                # ---- protect a winner: move the stop to breakeven once price is far enough in our favor
-                if breakeven_at_r > 0 and not open_t["be_moved"]:
-                    fav = (hi - open_t["entry"]) if up else (open_t["entry"] - lo)
-                    if fav / max(open_t["risk0"], 1e-9) >= breakeven_at_r:
-                        open_t["sl"] = open_t["entry"]
-                        open_t["be_moved"] = True
-                hit_tp = hi >= open_t["tp"] if up else lo <= open_t["tp"]
-                hit_sl = lo <= open_t["sl"] if up else hi >= open_t["sl"]
-                if not (hit_tp or hit_sl):
-                    still.append(open_t)
-                    continue
-                if hit_tp and hit_sl:
-                    # Both levels traded inside one candle - we don't actually know which came
-                    # first. Approximate: whichever level the candle's open sat closer to.
-                    win = abs(be.o[i] - open_t["tp"]) <= abs(be.o[i] - open_t["sl"])
+            for ot in open_ts:
+                if ot["exit_ts"] is not None and ot["exit_ts"] <= t_open:
+                    had_close = True          # it finished on candle i (or before) - no longer running
                 else:
-                    win = hit_tp
-                if win:
-                    result, r = "win", open_t["reward_r"]
-                elif open_t["be_moved"]:
-                    result, r = "breakeven", 0.0
-                else:
-                    result, r = "loss", -1.0
-                open_t.update(exit_ts=int(be.t[i]), result=result, r=round(r, 3),
-                              exit_price=open_t["tp"] if win else open_t["sl"])
-                trades.append(open_t)
-            had = len(open_ts)
+                    still.append(ot)
             open_ts = still
-            if max_open <= 1 and had:      # single-trade mode: no new entry on the candle a trade closed / while one runs
-                continue
-        if len(open_ts) >= max_open:
+        if max_open <= 1 and had_close:       # single-trade mode: no new entry on the candle a trade closed
+            continue
+        if len(open_ts) >= max_open and not collect_previews:
             continue
 
         k1, k4 = int(np.searchsorted(end1, T, side="right")), int(np.searchsorted(end4, T, side="right"))
@@ -147,40 +174,134 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
         if k4 != c4:
             h4, c4 = H4Ctx(df4.iloc[:k4]), k4
         if scalp:
-            if h1.trend == 0 or h1.trend == h4.trend:
+            if h1.trend == 0 and h4.trend == 0:
                 continue
         elif h4.trend == 0 or h1.trend != h4.trend:
             continue
-        res = evaluate_entry(h4, h1, be, i, cfg, bool(sess[i]), True, [], fast=True)
-        if res["direction"] in ("BUY", "SELL"):
-            cand = {"entry_ts": int(be.t[i]), "direction": res["direction"], "entry": res["entry"],
-                    "sl": res["stop_loss"], "tp": res["take_profit"], "agreement": res["agreement"],
-                    "grade": res["grade"], "session": sessions.tag_sessions(df_entry.index[i:i + 1])[0],
-                    "pattern": (res["pattern"] or {}).get("type"),
-                    "zone": (res["zone"] or {}).get("source"), "risk0": res["risk"],
-                    "reward_r": res.get("reward_r") or risk_reward, "be_moved": False,
-                    "style": style, "trade_type": res.get("trade_type"), "confirms": res.get("confirm_count")}
-            if open_ts:
-                ok, _why = can_open([{"direction": t["direction"], "entry": t["entry"], "sl": t["sl"]} for t in open_ts],
-                                    {"direction": cand["direction"], "entry": cand["entry"], "sl": cand["sl"]},
-                                    max_open=max_open)
-                if not ok:
-                    continue
-            open_ts.append(cand)
-    for open_t in open_ts:
-        open_t["result"] = "open"
-        trades.append(open_t)
+        res = evaluate_entry(h4, h1, be, i, cfg, bool(sess[i]), True, lv.at(T), fast=True)
+        fired = res["direction"] in ("BUY", "SELL")
+
+        if collect_previews and not fired:
+            _note_preview(previews, last_prev, res, i, ts_arr, step, cfg)
+        if not fired:
+            continue
+        if len(open_ts) >= max_open:
+            continue
+
+        # ---- the trade the engine wants; now fill it the way a real order would be filled
+        direction = res["direction"]
+        up = direction == "BUY"
+        sig_entry, sl, tp = float(res["entry"]), float(res["stop_loss"]), float(res["take_profit"])
+        risk_sig = abs(sig_entry - sl)
+        if fill == "close":
+            if i + 1 >= n:
+                continue
+            entry, start_i = sig_entry, i + 1
+        else:
+            if i + 1 >= n:
+                continue                        # the next candle has not printed yet: nothing to fill
+            entry, start_i = float(o_arr[i + 1]), i + 1
+        risk = abs(entry - sl)
+        past_tp = (entry >= tp) if up else (entry <= tp)
+        past_sl = (entry <= sl) if up else (entry >= sl)
+        if risk <= 1e-9 or past_tp or past_sl or abs(entry - sig_entry) > 0.5 * risk_sig:
+            skipped["missed_fill"] += 1
+            continue
+        cand = {"entry_ts": int(ts_arr[i]), "direction": direction, "entry": entry, "signal_entry": sig_entry,
+                "sl": sl, "tp": tp, "agreement": res["agreement"], "grade": res["grade"], "session": tags[i],
+                "pattern": (res["pattern"] or {}).get("type"), "zone": (res["zone"] or {}).get("source"),
+                "zone_tf": (res["zone"] or {}).get("tf"), "risk0": risk,
+                "reward_r": round(abs(tp - entry) / risk, 3), "be_moved": False, "style": style,
+                "trade_type": res.get("trade_type"), "confirms": res.get("confirm_count"),
+                "confirmations": res.get("confirmations"), "headline": res.get("headline")}
+        if open_ts:
+            ok, _why = can_open([{"direction": t["direction"], "entry": t["entry"], "sl": t["sl"]} for t in open_ts],
+                                {"direction": direction, "entry": entry, "sl": sl}, max_open=max_open)
+            if not ok:
+                skipped["overlap"] += 1
+                continue
+
+        # ---- resolve it with the SAME function the live tracker uses (conservative on a stop+target candle)
+        stop_at = int(ts_arr[start_i]) + EXPIRE_SECONDS
+        end_i = int(np.searchsorted(ts_arr, stop_at, side="right"))
+        sl_ = slice(start_i, max(end_i, start_i + 1))
+        st = _tr.replay({"direction": direction, "entry": entry, "sl": sl, "tp": tp, "start_ts": int(ts_arr[start_i])},
+                        ts_arr[sl_], o_arr[sl_], h_arr[sl_], l_arr[sl_], c_arr[sl_], be_at=breakeven_at_r)
+        cost_r = cost_price / risk if cost_price else 0.0
+        cand["cost_r"] = round(cost_r, 3)
+        cand["be_moved"] = bool(st["be_moved"])
+        cand["max_r"], cand["min_r"] = st["max_r"], st["min_r"]
+        if st["status"] == "won":
+            cand.update(result="win", r_gross=st["result_r"], exit_ts=st["closed_ts"], exit_price=st["outcome_price"])
+        elif st["status"] == "lost":
+            cand.update(result="loss", r_gross=-1.0, exit_ts=st["closed_ts"], exit_price=st["outcome_price"])
+        elif st["status"] == "breakeven":
+            cand.update(result="breakeven", r_gross=0.0, exit_ts=st["closed_ts"], exit_price=entry)
+        elif end_i < n:
+            cand.update(result="expired", r_gross=0.0, exit_ts=int(ts_arr[min(end_i, n - 1)]), exit_price=None)
+        else:
+            cand.update(result="open", r_gross=0.0, exit_ts=None, exit_price=None)
+        if cand["result"] in ("win", "loss", "breakeven"):
+            cand["r"] = round(cand["r_gross"] - cost_r, 3)
+            # a win that costs more than it earns is still a win in direction, but must not count as profit
+            cand["bars_held"] = int((cand["exit_ts"] - int(ts_arr[start_i])) // step) + 1
+        else:
+            cand["r"] = 0.0
+        trades.append(cand)
+        open_ts.append(cand)
+
+    for ot in open_ts:
+        if ot["result"] not in ("win", "loss", "breakeven", "expired", "open"):
+            ot["result"] = "open"
     trades.sort(key=lambda t: t["entry_ts"])
 
     closed_ = sorted((t for t in trades if t.get("result") in ("win", "loss", "breakeven")), key=lambda t: t["exit_ts"])
-    out = summarize(closed_ + [t for t in trades if t.get("result") == "open"])
+    out = summarize(closed_ + [t for t in trades if t.get("result") in ("open", "expired")])
     out["trades"] = trades
-    out["equity_ts"] = [int(be.t[30])] + [t["exit_ts"] for t in closed_]
-    out["style"], out["max_open"] = style, max_open
+    out["equity_ts"] = [int(ts_arr[30])] + [t["exit_ts"] for t in closed_]
+    out["style"], out["max_open"], out["sens"] = style, max_open, cfg.sens
     out["bars"] = n
     out["htf_source"] = "real 1H history" if df_1h is not None else "derived from entry candles"
     out["min_agreement_requested"] = min_agreement
     out["min_agreement_effective"] = round(eff_min, 1)
     out["breakeven_at_r"] = breakeven_at_r
-    out["from_ts"], out["to_ts"] = int(be.t[0]), int(be.t[-1])
+    out["from_ts"], out["to_ts"] = int(ts_arr[0]), int(ts_arr[-1])
+    out["fill"], out["spread"], out["slippage"] = fill, spread, slippage
+    out["skipped"] = skipped
+    out["expired"] = sum(1 for t in trades if t.get("result") == "expired")
+    out["total_cost_r"] = round(sum(t.get("cost_r", 0.0) for t in closed_), 2)
+    days = max((out["to_ts"] - out["from_ts"]) / 86400.0, 1e-9)
+    out["trades_per_day"] = round(len(trades) / days, 2)
+    out["days"] = round(days, 1)
+    if collect_previews:
+        out["previews"] = previews
     return out
+
+
+def _note_preview(previews: list, last: dict, res: dict, i: int, ts, step: int, cfg: Cfg) -> None:
+    """Record what the engine saw on a bar that did NOT become a trade, but got close (for the chart replay):
+      tap       price touched a zone, no trigger candle yet          (one per zone touch, not one per bar)
+      near_miss zone touched AND a trigger candle printed, but a rule stopped it (session, risk, confirmation...)."""
+    d = res.get("d", 0)
+    if not d:
+        return
+    if res.get("status") == "low_agreement" or (res.get("gates_ok") and res.get("direction") == "WAIT"):
+        why = f"agreement {res.get('agreement', 0):.0f}% < {cfg.min_agreement:.0f}%"
+        kind, blocked = "near_miss", "agreement"
+    elif res.get("zone_ok") and res.get("pat_ok"):
+        kind, blocked = "near_miss", res.get("blocked_by") or "rule"
+        why = {"session": "outside London / New York", "confluence": "trigger candle had too little backing",
+               "extension": "move already stretched (RSI)", "risk": "stop would be too wide"}.get(blocked, blocked)
+    elif res.get("zone_ok"):
+        kind, blocked, why = "tap", "trigger", "zone touched, waiting for a trigger candle"
+    else:
+        return
+    key = (kind, d)
+    gap = _tf_scale(step, 6)
+    if i - last.get(key, -10_000) < gap:
+        return
+    last[key] = i
+    p = (res.get("pattern") or {})
+    previews.append({"ts": int(ts[i]), "direction": "BUY" if d > 0 else "SELL", "kind": kind, "blocked_by": blocked,
+                     "why": why, "pattern": p.get("label"), "zone": (res.get("zone") or {}).get("source"),
+                     "price": res.get("price")})

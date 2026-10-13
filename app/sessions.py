@@ -73,6 +73,18 @@ def allowed_mask(index: pd.DatetimeIndex) -> np.ndarray:
     return out
 
 
+def market_open_mask(index: pd.DatetimeIndex, futures: bool = True) -> np.ndarray:
+    """Vectorised twin of market_open(): True where the market trades (closed Fri 17:00 -> Sun 18:00 New York,
+    plus the 17:00-18:00 daily break for futures)."""
+    ny = index.tz_convert("America/New_York")
+    wd = np.asarray(ny.dayofweek)
+    mins = np.asarray(ny.hour) * 60 + np.asarray(ny.minute)
+    closed = (wd == 5) | ((wd == 4) & (mins >= 17 * 60)) | ((wd == 6) & (mins < 18 * 60))
+    if futures:
+        closed |= (mins >= 17 * 60) & (mins < 18 * 60)
+    return ~closed
+
+
 # ---------------------------------------------------------------------- scalar
 def _is_open(name: str, now: datetime) -> bool:
     tz, oh, om, ch, cm = SESSIONS[name]

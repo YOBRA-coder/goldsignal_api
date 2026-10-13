@@ -185,3 +185,101 @@ def test_backtest_concurrent_and_styles_run():
     for kw in ({"max_open": 1}, {"max_open": 3}, {"style": "scalp", "max_open": 2}):
         out = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", None, 1.0, **kw)
         assert "total_trades" in out and "breakevens" in out
+
+
+# ------------------------------------------------------------- v4: candles, store, scalp, realistic backtest, catch-up
+def _m15(n=96, start="2026-09-22 08:00", seed=3):
+    idx = pd.date_range(start, periods=n, freq="15min", tz="UTC")
+    rng = np.random.default_rng(seed)
+    c = 3300 + np.cumsum(rng.normal(0, 1, n))
+    o = np.r_[c[0], c[:-1]] + rng.normal(0, .15, n)
+    return pd.DataFrame({"Open": o, "High": np.maximum(o, c) + .5, "Low": np.minimum(o, c) - .5, "Close": c,
+                         "Volume": 100.}, index=idx)
+
+
+def test_clean_candles_aligns_fills_holes_and_keeps_weekends_empty():
+    df = _m15()
+    bad = df.drop(df.index[[20, 21, 22, 50]]).copy()
+    bad.index = bad.index + pd.to_timedelta(np.where(np.arange(len(bad)) % 7 == 0, 20, 0), unit="s")
+    bad.iloc[10, bad.columns.get_loc("High")] = bad.iloc[10]["Open"] - 1          # high below the open
+    info = {}
+    out = f.clean_candles(bad, "15m", True, info=info)
+    assert len(out) == 96 and info["filled"] == 4 and info["fixed"] >= 1
+    assert (out.index.as_unit("s").asi8 % 900 == 0).all() and (np.diff(out.index.as_unit("s").asi8) == 900).all()
+    assert (out.High >= out[["Open", "Close"]].max(axis=1)).all() and (out.Low <= out[["Open", "Close"]].min(axis=1)).all()
+    row = lambda t: pd.DataFrame({"Open": 1., "High": 2., "Low": .5, "Close": 1.5, "Volume": 1.},
+                                 index=pd.date_range(t, periods=8, freq="15min", tz="UTC"))
+    wk = pd.concat([row("2026-09-25 19:00"), row("2026-09-27 23:00")])             # Fri close ... Sun reopen
+    info = {}
+    assert len(f.clean_candles(wk, "15m", True, info=info)) == 16 and info["filled"] == 0
+
+
+def test_candle_store_accumulates_history(tmp_path, monkeypatch):
+    from app import candle_store as cs
+    monkeypatch.setenv("GOLDSIGNAL_CANDLE_DB", str(tmp_path / "c.db"))
+    df = _m15(200, start="2026-10-01 00:00")
+    far = 10 ** 10
+    assert cs.upsert("T", "15m", df.iloc[:120], closed_before=far) == 120
+    fresh = df.iloc[100:]                                    # a later download no longer contains the oldest bars
+    merged = cs.merge(fresh, "T", "15m")
+    assert len(merged) == 200 and merged.index.is_unique and merged.index.is_monotonic_increasing
+    last = df.iloc[:119]                                     # the still-forming candle is never stored
+    assert cs.upsert("U", "15m", df.iloc[:5], closed_before=df.index[3].timestamp() + 900) == 4
+
+
+def test_merge_live_extends_but_never_shrinks_a_candle(monkeypatch):
+    base = _m15(40)
+    last = base.index[-1]
+    base.loc[last, ["Open", "High", "Low", "Close"]] = [100, 110, 90, 105]
+    tape = pd.DataFrame({"Open": 104., "High": 108., "Low": 99., "Close": 107., "Volume": 5.},
+                        index=pd.date_range(last, periods=3, freq="1min", tz="UTC"))
+    monkeypatch.setattr(f, "_get_raw", lambda *a, **k: tape)
+    out = f.merge_live(base, "15m", "T")
+    r = out.loc[last]
+    assert (r.Open, r.High, r.Low, r.Close) == (100, 110, 90, 107)      # open kept, range kept, close follows the tape
+    assert len(out) == len(base)
+
+
+def _demo_frames(sym="GC=F", tf="15m"):
+    df = f.drop_incomplete(f.get_candles(sym, tf, "30d", live=False), tf)
+    return df, f.drop_incomplete(f.get_candles(sym, "1h", live=False), "1h")
+
+
+def test_scalp_mode_produces_trades_and_strict_swing_is_not_looser():
+    df, d1 = _demo_frames("GC=F", "5m")
+    scalp = bt.run_backtest(df, "5m", 2.0, 70, True, "GC=F", d1, 1.0, style="scalp", max_open=2)
+    assert scalp["total_trades"] >= 5, "scalp mode must actually trade (it used to need 1H and 4H to disagree)"
+    strict = bt.run_backtest(df, "5m", 2.0, 70, True, "GC=F", d1, 1.0, style="swing", max_open=3, sens="strict")
+    high = bt.run_backtest(df, "5m", 2.0, 70, True, "GC=F", d1, 1.0, style="swing", max_open=3, sens="high")
+    assert high["total_trades"] >= strict["total_trades"]
+
+
+def test_backtest_realistic_fill_costs_and_conservative_stop():
+    df, d1 = _demo_frames("GC=F", "15m")
+    real = bt.run_backtest(df, "15m", 2.0, 60, True, "GC=F", d1, 1.0, style="scalp", max_open=3, spread=0.4, fill="next_open")
+    close = bt.run_backtest(df, "15m", 2.0, 60, True, "GC=F", d1, 1.0, style="scalp", max_open=3, fill="close")
+    assert real["total_trades"] > 0
+    ts = {int(v): i for i, v in enumerate(df.index.as_unit("s").asi8)}
+    for t in real["trades"]:
+        i = ts[t["entry_ts"]]
+        assert abs(t["entry"] - float(df["Open"].iloc[i + 1])) < 1e-6        # filled at the NEXT candle's open
+        if t["result"] in ("win", "loss", "breakeven"):
+            assert abs(t["r"] - (t["r_gross"] - t["cost_r"])) < 1e-2 and t["cost_r"] > 0
+    assert real["total_cost_r"] > 0 and close["total_cost_r"] == 0
+
+
+def test_catch_up_scan_finds_the_same_signal_the_backtest_did():
+    from app import strategy as S
+    df, d1 = _demo_frames("GC=F", "5m")
+    res = bt.run_backtest(df, "5m", 2.0, 70, True, "GC=F", d1, 1.0, style="scalp", max_open=3, fill="close")
+    t = res["trades"][len(res["trades"]) // 2]
+    cut = df[df.index.as_unit("s").asi8 <= t["entry_ts"]]                       # the data as it was when it fired
+    step = 300
+    d1c = d1[d1.index.as_unit("s").asi8 + 3600 <= t["entry_ts"] + step]
+    d4c = f.resample_ohlc(d1c, "4h", "GC=F")
+    d4c = d4c[d4c.index.as_unit("s").asi8 + 14400 <= t["entry_ts"] + step]
+    cfg = S.Cfg(rr=2.0, min_agreement=S.min_agreement_for(70, 2.0, step, "scalp"), sessions_only=True,
+                entry_seconds=step, entry_interval="5m", style="scalp", **S.engine_flags("scalp", "normal"))
+    lv = bt._Levels(d1, "GC=F").at(t["entry_ts"] + step)
+    found = S.scan_missed(d4c, d1c, cut, cfg, lv, sessions.allowed_mask(cut.index), True, t["entry_ts"] - 10 * step)
+    assert any(x["candle_ts"] == t["entry_ts"] and x["direction"] == t["direction"] for x in found)

@@ -88,6 +88,8 @@ class SignalOut(BaseModel):
     min_r: Optional[float] = None
     health: Optional[str] = None
     health_note: Optional[str] = None
+    missed: Optional[bool] = None
+    sens: Optional[str] = None
 
     @field_serializer("created_at", "closed_at")
     def _ser(self, v):
@@ -125,13 +127,17 @@ class ProfileStats(BaseModel):
 
 class BacktestRequest(BaseModel):
     symbol: str = "GC=F"
-    period: str = "59d"           # Yahoo only serves ~60 days of 5m/15m history
+    period: str = "59d"           # longer periods use the stored candle history (it grows as the app runs)
     entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m"
     risk_reward: float = 2.0
     min_agreement: float = 70.0
     sessions_only: bool = True
     breakeven_at_r: float = 1.0   # move stop to entry after this many R in favor; 0 disables it
     style: Literal["swing", "scalp"] = "swing"
+    sens: Literal["strict", "normal", "high"] = "normal"   # entry sensitivity (same switch as the live scanner)
+    spread: Optional[float] = None    # price units; None = automatic (about 1 basis point of price)
+    slippage: float = 0.0
+    realistic_fill: bool = True       # True: enter on the NEXT candle's open; False: at the signal candle's close
 
 
 class BacktestOut(BaseModel):
