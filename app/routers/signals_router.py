@@ -295,7 +295,8 @@ def _setup_alert(db: Session, user: models.User, symbol: str, entry_interval: st
 
 def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interval: str = "15m",
              min_agreement: float = 70, sessions_only: bool = True, rr: float = 2.0, breakeven_at_r: float = 1.0,
-             scalp: bool = False, sens: str = "normal", persist: bool = True, background: bool = False) -> dict:
+             scalp: bool = False, sens: str = "normal", persist: bool = True, background: bool = False,
+             log_scan: bool = True, track: bool = True) -> dict:
     """One full evaluation of a pair. Called by the page (/signals/live) and by the background scanner.
     Raises DataUnavailable when the feed is down."""
     raw4 = get_candles(symbol, "4h")
@@ -347,7 +348,7 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
     sig["session"] = {"label": sess["label"], "active": sess["active"], "allowed": sess["trade_allowed"]}
 
     # ---- early-warning: did the 4H/1H bias itself shift? (independent of whether a full signal fired)
-    if market_ok:
+    if market_ok and persist:
         try:
             check_bias_shift(db, user, symbol, sig["bias_4h"], sig["bias_1h"])
         except Exception:  # noqa: BLE001 - never let an alert-side bug break the live endpoint
@@ -358,6 +359,8 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
                 "one_h_preview": sig.get("one_h_preview"), "entry_shift_preview": sig.get("entry_shift_preview"),
                 "counter_watch": sig.get("counter_watch"), "highlights": sig.get("highlights")}
     try:
+        if not log_scan:
+            raise StopIteration
         db.add(models.ScanLog(
             user_id=user.id, symbol=symbol, entry_interval=entry_interval, status=sig["status"],
             headline=sig["headline"], direction=sig["direction"] if sig["direction"] in ("BUY", "SELL") else None,
@@ -370,13 +373,16 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
         if stale:
             db.query(models.ScanLog).filter(models.ScanLog.id.in_([s_.id for s_ in stale])).delete(synchronize_session=False)
         db.commit()
+    except StopIteration:
+        pass
     except Exception:  # noqa: BLE001 - the scan log is diagnostic only, never block the live endpoint on it
         db.rollback()
 
     # ---- track every running trade (TP / SL / breakeven / health), then add fresh ones this scan produced
     newly_closed, snaps = [], []
     try:
-        newly_closed, snaps = track_open(db, user)
+        if track:
+            newly_closed, snaps = track_open(db, user)
     except Exception:  # noqa: BLE001 - a feed hiccup on another pair must not hide this pair's signal
         db.rollback()
 
@@ -519,6 +525,35 @@ def live_signal(
         return run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, breakeven_at_r, scalp, sens, persist)
     except DataUnavailable as e:
         raise unavailable(e)
+
+
+@router.get("/brief")
+def brief(
+    symbol: str = "GC=F",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
+    min_agreement: float = Query(70, ge=0, le=100),
+    sessions_only: bool = True,
+    rr: float = Query(2.0, ge=0.5, le=10),
+    scalp: bool = False,
+    sens: Literal["strict", "normal", "high"] = "normal",
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Read-only 'what is happening and what is expected' for one pair + entry timeframe (the full-screen chart's log
+    pop-up). Same engine as /live but it records nothing: no scan-log row, no signal, no alert, no trade tracking."""
+    try:
+        out = run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, 1.0, scalp, sens,
+                       persist=False, log_scan=False, track=False)
+    except DataUnavailable as e:
+        raise unavailable(e)
+    rows = db.query(models.ScanLog).filter(
+        models.ScanLog.user_id == user.id, models.ScanLog.symbol == symbol,
+        models.ScanLog.entry_interval == entry_interval).order_by(desc(models.ScanLog.ts)).limit(10).all()
+    recent = [{"ts": int(r.ts.replace(tzinfo=timezone.utc).timestamp()), "status": r.status, "headline": r.headline,
+               "direction": r.direction, "agreement": r.agreement} for r in rows]
+    return {"symbol": symbol, "entry_interval": entry_interval, "signal": out["signal"], "scalp_signal": out["scalp_signal"],
+            "sessions": out["sessions"], "data": out["data"], "recent": recent,
+            "open_trades": [t for t in out["open_trades"] if t["symbol"] == symbol], "updated_at": out["updated_at"]}
 
 
 # ---------------------------------------------------------------------- replay (scroll-back signals)

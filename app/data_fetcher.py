@@ -537,7 +537,12 @@ def clean_candles(df: pd.DataFrame, interval: str, futures: bool = True, max_fil
         adj = np.diff(secs) == step
         gap = o[1:] - c[:-1]
         rng = pd.Series(h - l).rolling(50, min_periods=10).median().to_numpy()[:-1]
-        snap = adj & (np.abs(gap) > 0) & (np.abs(gap) <= 0.5 * np.nan_to_num(rng, nan=0.0))
+        # Yahoo's FX / 1m bars are often single-tick (open = high = low = close) so the typical RANGE is ~0 and a
+        # range-only threshold never snapped anything - the chart came out as dots and dashes. Typical close-to-close
+        # movement is the fairer yardstick: a candle that opens within ~2x of it of the previous close is continuous.
+        mov = pd.Series(np.abs(np.diff(c, prepend=c[0]))).rolling(100, min_periods=10).mean().to_numpy()[:-1]
+        thr = np.maximum(0.5 * np.nan_to_num(rng, nan=0.0), 3.0 * np.nan_to_num(mov, nan=0.0))
+        snap = adj & (np.abs(gap) > 0) & (np.abs(gap) <= thr)
         if snap.any():
             o2 = o.copy()
             o2[1:][snap] = c[:-1][snap]
@@ -546,6 +551,9 @@ def clean_candles(df: pd.DataFrame, interval: str, futures: bool = True, max_fil
             out = out.copy()
             out["Open"], out["High"], out["Low"] = o2, h, l
             info["smoothed"] = int(snap.sum())
+    if info.get("filled"):
+        out = out.copy()
+        out["Filled"] = out.index.isin(flat.index)       # lets the chart draw these slots empty instead of fake dashes
     return out
 
 

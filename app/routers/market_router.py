@@ -59,8 +59,11 @@ def candles(
     tags = sessions.tag_sessions(df.index) if intraday else None
     rows = []
     o, h, l, c, v = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close", "Volume"))
+    fl = df["Filled"].to_numpy(bool) if "Filled" in df.columns else None
     for k in range(len(df)):
         r = {"time": int(times[k]), "open": o[k], "high": h[k], "low": l[k], "close": c[k], "volume": v[k]}
+        if fl is not None and fl[k]:
+            r["filled"] = True          # a bar the feed never printed (inserted flat): drawn empty on the candle chart
         if tags:
             r["session"] = tags[k]
         rows.append(r)

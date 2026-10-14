@@ -285,7 +285,7 @@ def _note_preview(previews: list, last: dict, res: dict, i: int, ts, step: int, 
     d = res.get("d", 0)
     if not d:
         return
-    if res.get("status") == "low_agreement" or (res.get("gates_ok") and res.get("direction") == "WAIT"):
+    if res.get("status") == "low_agreement" or (res.get("gates_ok") and res.get("direction") == "WAIT" and res.get("agreement") is not None):
         why = f"agreement {res.get('agreement', 0):.0f}% < {cfg.min_agreement:.0f}%"
         kind, blocked = "near_miss", "agreement"
     elif res.get("zone_ok") and res.get("pat_ok"):

@@ -283,3 +283,22 @@ def test_catch_up_scan_finds_the_same_signal_the_backtest_did():
     lv = bt._Levels(d1, "GC=F").at(t["entry_ts"] + step)
     found = S.scan_missed(d4c, d1c, cut, cfg, lv, sessions.allowed_mask(cut.index), True, t["entry_ts"] - 10 * step)
     assert any(x["candle_ts"] == t["entry_ts"] and x["direction"] == t["direction"] for x in found)
+
+
+def test_headline_names_the_gate_that_blocked_not_low_agreement():
+    """A blocked mandatory gate (anti-chase / confirmation) used to be reported as 'agreement 64% < 63%'."""
+    from app import strategy as S
+    df, d1 = _demo_frames("GC=F", "5m")
+    d4 = f.resample_ohlc(d1, "4h", "GC=F")
+    h4, h1 = S.H4Ctx(d4), S.H1Ctx(d1)
+    be = S.Bars(df)
+    cfg = S.Cfg(entry_seconds=300, entry_interval="5m", min_agreement=60, style="scalp", **S.engine_flags("scalp"))
+    seen = set()
+    for i in range(be.n - 1500, be.n):
+        r = S.evaluate_entry(h4, h1, be, i, cfg, True, True, [])
+        if r["status"] == "low_agreement":
+            assert r["agreement"] < cfg.min_agreement and r["gates_ok"]
+        if r["status"] in ("stretched", "needs_confirmation", "blocked"):
+            assert not r["gates_ok"] and "blocked" in r["headline"]
+        seen.add(r["status"])
+    assert seen
