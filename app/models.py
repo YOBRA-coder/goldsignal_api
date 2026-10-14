@@ -177,3 +177,21 @@ class ScanState(Base):
     params_json = Column(Text, nullable=True)        # rr / min_agreement / sessions_only / sens / scalp of the last scan
     updated_at = Column(DateTime, default=utcnow)
     seen_at = Column(DateTime, default=utcnow)       # last time a PAGE asked (the background scanner keeps going 3 days)
+
+
+class NewsEvent(Base):
+    """Economic-calendar events (CPI, NFP, FOMC, ...). Stored so a backtest / chart replay can see what the calendar
+    looked like on past days - the public feed only ever shows this week and next week."""
+    __tablename__ = "news_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    uid = Column(String, unique=True, index=True)       # currency|title|ts  (feed events are updated in place)
+    ts = Column(Integer, index=True)                    # release time, epoch seconds UTC
+    currency = Column(String, index=True)               # USD, EUR, GBP, JPY, ...
+    title = Column(String)
+    impact = Column(String, default="low")              # high | medium | low
+    forecast = Column(String, nullable=True)
+    previous = Column(String, nullable=True)
+    actual = Column(String, nullable=True)
+    source = Column(String, default="feed")             # feed | manual
+    created_at = Column(DateTime, default=utcnow)

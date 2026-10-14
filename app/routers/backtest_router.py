@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from .. import models, schemas, auth, backtest as bt
+from .. import models, schemas, auth, backtest as bt, news as news_mod
 from ..data_fetcher import DataUnavailable, drop_incomplete, get_candles
 from ..database import get_db
 
@@ -50,17 +50,21 @@ def run(
         raise HTTPException(400, f"Only {len(df)} bars available - need at least 600 for a meaningful backtest.")
     price = float(df["Close"].iloc[-1])
     spread = payload.spread if payload.spread is not None else round(price * 0.0001, 6)   # ~1 basis point of price
+    nwin = news_mod.windows(db, payload.symbol, int(df.index[0].timestamp()), int(df.index[-1].timestamp()),
+                            level=payload.news if payload.news in ("off", "high", "all") else None)
     result = bt.run_backtest(df, payload.entry_interval, payload.risk_reward, payload.min_agreement,
                              payload.sessions_only, payload.symbol, df1, payload.breakeven_at_r,
                              style=payload.style, max_open=3 if payload.style == "swing" else 2, sens=payload.sens,
                              spread=spread, slippage=payload.slippage,
-                             fill="next_open" if payload.realistic_fill else "close")
+                             fill="next_open" if payload.realistic_fill else "close", news_windows=nwin)
 
     stats = {k: result[k] for k in ("profit_factor", "max_drawdown_r", "best_streak", "worst_streak",
                                     "by_session", "by_direction", "equity_ts", "bars", "from_ts", "to_ts", "htf_source",
                                     "min_agreement_requested", "min_agreement_effective", "breakeven_at_r", "breakevens",
                                     "style", "max_open", "sens", "fill", "spread", "slippage", "skipped", "expired",
-                                    "total_cost_r", "trades_per_day", "days")}
+                                    "total_cost_r", "trades_per_day", "days", "diagnostics")}
+    stats["news_windows"] = len(nwin)
+    stats["news_level"] = payload.news or news_mod.settings.news_prefs()["filter"]
     stats["params"] = payload.model_dump()
     rec = models.BacktestRun(
         user_id=user.id, symbol=payload.symbol, period=period,

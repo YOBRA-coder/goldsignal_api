@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from . import confirm as cf
+from . import news as _news
 from . import sessions as _sessions
 from .indicators import ind
 from .structure import (BULL, BEAR, Bars, _pattern_from_ohlc, analyze_structure, base_zones, bias_name,
@@ -91,13 +92,21 @@ class Cfg:
     rsi_max: float = 60.0        # direction-adjusted entry-TF RSI above this = chasing
     rsi1_max: float = 70.0       # same for the 1H RSI
     fvg_extra: bool = False      # a gap-only zone tap must be backed by one more confirmation than an order block
-    scalp_rr: float = 1.5        # scalps aim for a nearer target
+    scalp_rr: float = 2.0        # scalps aim for a nearer target (v5: was 1.5 - a 1.5R win needs a 45%+ win rate just to break even)
     max_open: int = 3            # concurrent trades per symbol (live tracker + backtest)
     # ---- v4: entry finding. How many entry-TF bars back a zone touch still counts (scaled for 5m/1m), and
     # whether the entry timeframe's OWN order blocks / FVGs may be used as extra tap zones next to the 1H ones.
     tap_bars: int = 5
     local_zones: bool = False
     sens: str = "normal"         # label only: strict | normal | high (see engine_flags)
+    # ---- v5: fewer, better trades. The old engine took any setup with 1.0R+ of room, so many targets sat only
+    # 1.0-1.4R away: one stop-out (-1R, plus spread) ate two or three of those small wins.
+    min_room_r: float = 1.5      # the next real wall must be at least this many R away (scaled down for short rr)
+    chop_min: float = 0.07       # entry-TF efficiency ratio over 40 bars below this = pure chop, no entries
+    news_windows: tuple = ()     # ((start_ts, end_ts, label, impact), ...) high-impact news blackout, see news.py
+    spread: float = 0.0          # price units; with max_cost_r it rejects trades where the spread alone eats too much of the risk
+    max_cost_r: float = 0.15
+    cooldown_bars: int = 6       # after a stop-out, no new entry in the SAME direction for this many bars (x tf scale)
 
 
 def engine_flags(style: str = "swing", sens: str = "normal") -> dict:
@@ -313,15 +322,14 @@ def _add(checks: list, key, label, step, ok, detail, weight, gate=False, tf=None
 
 
 def realistic_target(h1: "H1Ctx", h4: "H4Ctx", d: int, price: float, risk: float, rr: float,
-                     levels: list[dict]) -> tuple[float, str]:
+                     levels: list[dict], min_room: float = 1.0) -> tuple[float, str]:
     """Aim the take-profit at the nearest REAL opposing level ahead of price (1H zone/pool first, then
     4H zone/pool, then a daily/weekly key level) instead of a blind R-multiple.
 
-    A blind rr*risk target can sit well past real resistance/support (price statistically won't reach
-    it) or well short of it (the setup gets marked a 'loss' by the backtest even though it did
-    everything right and stalled at a real wall a hair under the arbitrary number). This never asks for
-    MORE than the requested rr*risk - only for less, and only when a real level sits closer than 1R
-    away is it worth shrinking to (a level inside 1R means the setup barely had room to begin with)."""
+    A level closer than 1R is ignored (the setup barely had room to begin with). The nearest level at or past 1R is
+    the target - but if it is closer than `min_room` R the reward is too small for the risk: the reason then starts
+    with "blocked:" and the caller treats that as 'no room' (v5: skip it instead of taking a 1.1R win for a 1R risk).
+    Never asks for MORE than the requested rr*risk."""
     blind = rr * risk
     candidates: list[tuple[float, str]] = []
     for ctx, tag in ((h1, "1H"), (h4, "4H")):
@@ -347,6 +355,8 @@ def realistic_target(h1: "H1Ctx", h4: "H4Ctx", d: int, price: float, risk: float
     if not viable:
         return blind, "blind R-multiple (no real level in range)"
     dist, name = min(viable, key=lambda x: x[0])
+    if dist < min_room * risk:
+        return dist, f"blocked: {name} is only {dist / risk:.1f}R away"
     return min(dist, blind), name
 
 
@@ -557,6 +567,23 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     _add(checks, "session", "London / New York session", 4, sess_pass if sess_gate else (sess_pass or None),
          "London/NY session active" if sess_pass else "Outside London/New York - no entries", 1.5, sess_gate, tf_e)
 
+    # ---- news blackout: a high-impact release (CPI / NFP / FOMC ...) is about to hit or just hit this pair
+    nw, nn = _news.hit(cfg.news_windows, t + cfg.entry_seconds)
+    if cfg.news_windows:
+        _add(checks, "news", "No high-impact news right now", 4, nw is None,
+             (f"Blackout: {nw[2]} ({'ends' if nw[1] > t else 'ended'} {datetime.fromtimestamp(nw[1], timezone.utc):%H:%M} UTC)" if nw else
+              (f"Next: {nn[2]} at {datetime.fromtimestamp(nn[0], timezone.utc):%a %H:%M} UTC (blackout starts)" if nn else "No news blackout ahead")),
+             0.0, True, tf_e)
+
+    # ---- chop: no direction at all over the last 40 bars (price went nowhere while travelling a lot)
+    if i >= 40:
+        net = abs(float(be.c[i] - be.c[i - 40]))
+        path = float(np.abs(np.diff(be.c[i - 40:i + 1])).sum())
+        er = net / path if path > 0 else 0.0
+        _add(checks, "chop", "Entry timeframe is not pure chop", 4, er >= cfg.chop_min,
+             f"Efficiency {er:.2f} over 40 bars" + ("" if er >= cfg.chop_min else " - price is going nowhere, setups fail here"),
+             0.0, True, tf_e)
+
     # ---- momentum + volatility regime: two checks the original release had no read on at all, which
     # is exactly what let a technically-qualifying but dead/choppy candle count the same as a decisive
     # one, and let a news-spike range get graded like an ordinary one. Both non-gating (soft) - they
@@ -579,6 +606,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     risk_ok = False
     tp_reason = None
     rr_used = min(cfg.rr, cfg.scalp_rr) if scalp else cfg.rr
+    room_need = min(cfg.min_room_r, 0.8 * rr_used)
     if zone_ok:
         # Below 15m, a fixed-ATR stop that's fine on 15m/30m sits so close to price that ordinary
         # noise (and real-world spread) stops the trade out before the 4H/1H thesis has had room to
@@ -596,18 +624,28 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
             sl = min(tapped["bottom"], float(be.l[seg].min())) - pad_mult * a_e
             risk = max(price - sl, floor_mult * a_e)
             sl = price - risk
-            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, rr_used, levels)
+            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, rr_used, levels, room_need)
             tp = price + tgt_dist
         else:
             sl = max(tapped["top"], float(be.h[seg].max())) + pad_mult * a_e
             risk = max(sl - price, floor_mult * a_e)
             sl = price + risk
-            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, rr_used, levels)
+            tgt_dist, tp_reason = realistic_target(h1, h4, d, price, risk, rr_used, levels, room_need)
             tp = price - tgt_dist
         entry = price
         risk_ok = risk <= 3.0 * a_1
     _add(checks, "risk", "Stop distance is sensible (<= 3x 1H ATR)", 4, risk_ok if zone_ok else False,
          (f"Risk {risk:.2f} pts vs 1H ATR {a_1:.2f}" if zone_ok else "Pending zone tap"), 0.0, True, tf_e)
+    if cfg.spread > 0:
+        cost_r = (cfg.spread / risk) if (zone_ok and risk) else None
+        _add(checks, "cost", f"Spread is small next to the stop (<= {cfg.max_cost_r:.2f}R)", 4,
+             (cost_r <= cfg.max_cost_r) if cost_r is not None else None,
+             (f"Spread costs {cost_r:.2f}R of the {risk:.4g} stop" + ("" if cost_r <= cfg.max_cost_r else " - too much of the trade goes to costs")
+              if cost_r is not None else "Pending zone tap"), 0.0, True, tf_e)
+    room_ok = bool(zone_ok and tp_reason and not tp_reason.startswith("blocked"))
+    _add(checks, "room", f"Room to the next wall (target >= {room_need:.1f}R)", 4, room_ok if zone_ok else None,
+         (f"Target {abs(tp - price) / risk:.1f}R away - {tp_reason}" if room_ok else
+          (tp_reason.replace("blocked: ", "No room: ") if zone_ok and tp_reason else "Pending zone tap")), 0.0, True, tf_e)
 
     # ---- protect a winner: at this many R in favor, move the stop to breakeven (informational for
     # live signals - there's no order execution here - and actually enforced in the backtest engine)
@@ -822,7 +860,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         # a mandatory gate the headline chain above does not name (anti-chase RSI, or too little backing behind the
         # trigger candle) - say THAT, not "low agreement" (the old text blamed the score even when the score was fine)
         bad = next(c for c in checks if c["gate"] and not c["ok"])
-        status = "stretched" if bad["key"] == "extension" else "needs_confirmation" if bad["key"] == "confluence" else "blocked"
+        status = {"extension": "stretched", "confluence": "needs_confirmation", "room": "no_room", "news": "news", "cost": "blocked",
+                  "chop": "choppy"}.get(bad["key"], "blocked")
         head = f"Trigger present but blocked: {bad['detail']}"
     elif not fired:
         status, head = "low_agreement", f"Trigger present but agreement {agreement:.1f}% < {cfg.min_agreement:.1f}% minimum"
@@ -1032,7 +1071,7 @@ def build_outlook(h4: "H4Ctx", h1: "H1Ctx", be: Bars, sess_mask: np.ndarray | No
             stop = (zone["bottom"] - 0.4 * a_e) if buy else (zone["top"] + 0.4 * a_e)
             risk = max(abs(mid - stop), 0.6 * a_e)
             rr_plan = min(cfg.rr, cfg.scalp_rr) if not with_trend else cfg.rr
-            tgt_dist, tgt_why = realistic_target(h1, h4, dd, mid, risk, rr_plan, levels)
+            tgt_dist, tgt_why = realistic_target(h1, h4, dd, mid, risk, rr_plan, levels, min(cfg.min_room_r, 0.8 * rr_plan))
             pl["plan"] = {"entry_zone": [zone["bottom"], zone["top"]], "entry": mid, "stop": stop,
                           "target": mid + tgt_dist if buy else mid - tgt_dist, "target_why": tgt_why,
                           "risk": risk, "reward_r": round(tgt_dist / risk, 2)}

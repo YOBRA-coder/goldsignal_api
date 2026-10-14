@@ -16,7 +16,8 @@ import threading
 _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "settings.json")
 _lock = threading.Lock()
 _state: dict | None = None
-DEFAULTS = {"anchor": "ny_close", "offsets": {}, "offset_set_at": {}}
+DEFAULTS = {"anchor": "ny_close", "offsets": {}, "offset_set_at": {},
+            "news": {"filter": "high", "before": 30, "after": 20}}
 
 
 def _load() -> dict:
@@ -69,3 +70,22 @@ def set_offset(symbol: str, value: float | None, at: int | None = None) -> None:
             st["offsets"][symbol] = float(value)
             st["offset_set_at"][symbol] = at
         _save()
+
+
+def news_prefs() -> dict:
+    with _lock:
+        return {**DEFAULTS["news"], **(_load().get("news") or {})}
+
+
+def set_news_prefs(filter: str | None = None, before: int | None = None, after: int | None = None) -> dict:
+    with _lock:
+        cur = {**DEFAULTS["news"], **(_load().get("news") or {})}
+        if filter in ("off", "high", "all"):
+            cur["filter"] = filter
+        if before is not None:
+            cur["before"] = max(0, min(240, int(before)))
+        if after is not None:
+            cur["after"] = max(0, min(240, int(after)))
+        _load()["news"] = cur
+        _save()
+        return dict(cur)

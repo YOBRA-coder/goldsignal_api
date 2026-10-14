@@ -73,6 +73,61 @@ def summarize(trades: list[dict]) -> dict:
     }
 
 
+def diagnostics(trades: list[dict]) -> dict:
+    """Why a run loses: break-even win rate, how many losers were once in profit, and which buckets lose money.
+    All from the closed trades of the run (max_r = best excursion in R before the trade ended)."""
+    cl = [t for t in trades if t.get("result") in ("win", "loss", "breakeven")]
+    if not cl:
+        return {}
+    wins = [t["r"] for t in cl if t["result"] == "win"]
+    loss = [t["r"] for t in cl if t["result"] == "loss"]
+    lo = [t for t in cl if t["result"] == "loss"]
+    aw, al = (sum(wins) / len(wins) if wins else 0.0), (-sum(loss) / len(loss) if loss else 1.0)
+    need = al / (aw + al) * 100 if (aw + al) > 0 else None
+
+    def bucket(key):
+        d: dict = {}
+        for t in cl:
+            k = key(t)
+            if k is None:
+                continue
+            b = d.setdefault(str(k), {"trades": 0, "wins": 0, "net_r": 0.0})
+            b["trades"] += 1
+            b["wins"] += t["result"] == "win"
+            b["net_r"] = round(b["net_r"] + t["r"], 2)
+        for b in d.values():
+            b["win_rate"] = round(100 * b["wins"] / b["trades"], 1)
+        return d
+    ag = bucket(lambda t: "<70" if t["agreement"] < 70 else "70-79" if t["agreement"] < 80 else "80+")
+    out = {
+        "avg_win_r": round(aw, 2), "avg_loss_r": round(-al, 2), "breakeven_win_rate": round(need, 1) if need else None,
+        "losers_reached_half_r": sum(1 for t in lo if t.get("max_r", 0) >= 0.5),
+        "losers_reached_1r": sum(1 for t in lo if t.get("max_r", 0) >= 0.99),
+        "losers": len(lo), "avg_loser_mfe_r": round(sum(t.get("max_r", 0) for t in lo) / len(lo), 2) if lo else 0.0,
+        "avg_bars_win": round(sum(t.get("bars_held", 0) for t in cl if t["result"] == "win") / max(1, len(wins)), 1),
+        "avg_bars_loss": round(sum(t.get("bars_held", 0) for t in lo) / max(1, len(lo)), 1),
+        "by_agreement": ag, "by_grade": bucket(lambda t: t.get("grade")), "by_pattern": bucket(lambda t: t.get("pattern")),
+        "by_zone": bucket(lambda t: t.get("zone")), "by_session": bucket(lambda t: t.get("session")),
+    }
+    weak = []
+    for name in ("by_agreement", "by_grade", "by_pattern", "by_zone", "by_session"):
+        for k, b in out[name].items():
+            if b["trades"] >= 8 and b["net_r"] < -2.0:
+                weak.append({"group": name[3:], "key": k, "trades": b["trades"], "win_rate": b["win_rate"], "net_r": b["net_r"]})
+    out["weak_spots"] = sorted(weak, key=lambda w: w["net_r"])[:5]
+    hints = []
+    if need and out["avg_win_r"] and len(cl) >= 20:
+        wr = 100 * len(wins) / len(cl)
+        hints.append(f"Break-even needs a {need:.0f}% win rate at these averages (+{aw:.2f}R / -{al:.2f}R); this run won {wr:.0f}%.")
+    if lo and out["losers_reached_half_r"] / len(lo) >= 0.4:
+        hints.append(f"{out['losers_reached_half_r']} of {len(lo)} losers were at least +0.5R in profit first - a "
+                     "nearer breakeven trigger (try 0.7R) or an earlier exit would save them.")
+    if lo and out["avg_bars_loss"] and out["avg_bars_loss"] < 4:
+        hints.append("Losers die within a few candles - the stop sits inside normal noise: use a higher timeframe or a stricter sensitivity.")
+    out["hints"] = hints
+    return out
+
+
 def _resample_1h(df: pd.DataFrame) -> pd.DataFrame:
     return (df.resample("1h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
             .dropna(subset=["Open", "Close"]))
@@ -114,20 +169,21 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
                  min_agreement: float = 70.0, sessions_only: bool = True, symbol: str = "GC=F",
                  df_1h: pd.DataFrame | None = None, breakeven_at_r: float = 1.0, style: str = "swing",
                  max_open: int = 1, spread: float = 0.0, slippage: float = 0.0, fill: str = "next_open",
-                 collect_previews: bool = False, **cfg_extra) -> dict:
+                 collect_previews: bool = False, news_windows=(), **cfg_extra) -> dict:
     """df_1h: real hourly history used to build the 1H/4H context, exactly like the live engine. Without it the
     1H/4H bars are derived from the entry candles.
     breakeven_at_r: once a trade is this many R in favor, its stop moves to entry (0 disables it).
     spread / slippage: price units (e.g. 0.30 for gold). Total cost per trade = spread + 2*slippage, charged in R.
     fill: "next_open" (default, realistic) or "close" (the live tracker's own convention: entry = signal close).
     collect_previews: also return the near-misses / zone taps the engine saw (used by the chart replay).
+    news_windows: ((start, end, label, impact), ...) high-impact blackouts (news.windows) - no entries inside them.
     cfg_extra: engine switches (see strategy.engine_flags); `sens` picks strict / normal / high."""
     step = INTERVAL_SECONDS[entry_interval]
     sens = cfg_extra.pop("sens", "normal")
     flags = {**engine_flags(style, sens), **cfg_extra}
     eff_min = min_agreement_for(min_agreement, risk_reward, step, style, flags.get("sens", sens))
     cfg = Cfg(rr=risk_reward, min_agreement=eff_min, sessions_only=sessions_only, entry_seconds=step,
-              entry_interval=entry_interval, breakeven_at_r=breakeven_at_r, style=style, **flags)
+              entry_interval=entry_interval, breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows or ()), spread=spread, **flags)
     df1 = df_1h if df_1h is not None else _resample_1h(df_entry)
     df4 = resample_ohlc(df1, "4h", symbol)
     end1 = df1.index.as_unit("s").asi8 + 3600
@@ -142,7 +198,9 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
 
     trades: list[dict] = []
     previews: list[dict] = []
-    skipped = {"missed_fill": 0, "overlap": 0}
+    skipped = {"missed_fill": 0, "overlap": 0, "cooldown": 0}
+    last_loss: dict[str, int] = {}      # direction -> exit_ts of the last stop-out (cool-down: no instant re-entry)
+    cool_s = _tf_scale(step, cfg.cooldown_bars) * step
     open_ts: list[dict] = []            # trades whose exit is still ahead of the current candle
     c1 = c4 = -1
     h1 = h4 = None
@@ -207,6 +265,9 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
         if risk <= 1e-9 or past_tp or past_sl or abs(entry - sig_entry) > 0.5 * risk_sig:
             skipped["missed_fill"] += 1
             continue
+        if cool_s and direction in last_loss and last_loss[direction] <= int(ts_arr[i]) < last_loss[direction] + cool_s:
+            skipped["cooldown"] += 1
+            continue
         cand = {"entry_ts": int(ts_arr[i]), "direction": direction, "entry": entry, "signal_entry": sig_entry,
                 "sl": sl, "tp": tp, "agreement": res["agreement"], "grade": res["grade"], "session": tags[i],
                 "pattern": (res["pattern"] or {}).get("type"), "zone": (res["zone"] or {}).get("source"),
@@ -247,6 +308,8 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
             cand["bars_held"] = int((cand["exit_ts"] - int(ts_arr[start_i])) // step) + 1
         else:
             cand["r"] = 0.0
+        if cand["result"] == "loss":
+            last_loss[direction] = max(last_loss.get(direction, 0), int(cand["exit_ts"]))
         trades.append(cand)
         open_ts.append(cand)
 
@@ -268,6 +331,8 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
     out["from_ts"], out["to_ts"] = int(ts_arr[0]), int(ts_arr[-1])
     out["fill"], out["spread"], out["slippage"] = fill, spread, slippage
     out["skipped"] = skipped
+    out["diagnostics"] = diagnostics(closed_)
+    out["news_blackouts"] = len(news_windows or ())
     out["expired"] = sum(1 for t in trades if t.get("result") == "expired")
     out["total_cost_r"] = round(sum(t.get("cost_r", 0.0) for t in closed_), 2)
     days = max((out["to_ts"] - out["from_ts"]) / 86400.0, 1e-9)
@@ -291,7 +356,8 @@ def _note_preview(previews: list, last: dict, res: dict, i: int, ts, step: int, 
     elif res.get("zone_ok") and res.get("pat_ok"):
         kind, blocked = "near_miss", res.get("blocked_by") or "rule"
         why = {"session": "outside London / New York", "confluence": "trigger candle had too little backing",
-               "extension": "move already stretched (RSI)", "risk": "stop would be too wide"}.get(blocked, blocked)
+               "extension": "move already stretched (RSI)", "risk": "stop would be too wide", "room": "no room to target",
+               "news": "high-impact news", "chop": "choppy market", "cost": "spread too big"}.get(blocked, blocked)
     elif res.get("zone_ok"):
         kind, blocked, why = "tap", "trigger", "zone touched, waiting for a trigger candle"
     else:

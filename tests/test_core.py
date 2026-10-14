@@ -302,3 +302,66 @@ def test_headline_names_the_gate_that_blocked_not_low_agreement():
             assert not r["gates_ok"] and "blocked" in r["headline"]
         seen.add(r["status"])
     assert seen
+
+
+# ------------------------------------------------------------- v5: news, room-to-target, loss cooldown
+def test_news_windows_and_rules():
+    from app import news
+    import time as _t
+    ts = int(_t.time())
+    ev = news.rule_events(ts - 40 * 86400, ts + 40 * 86400)
+    assert any("Non-Farm" in e["title"] for e in ev) and all(e["currency"] == "USD" for e in ev)
+    assert news.currencies_for("EURUSD=X") == {"EUR", "USD"} and news.currencies_for("GC=F") == {"USD"}
+    e = {"ts": 1_000_000, "title": "CPI m/m", "impact": "high", "currency": "USD"}
+    s_, t_ = news.window_for(e, 30, 20, "high")
+    assert s_ == 1_000_000 - 45 * 60 and t_ == 1_000_000 + 30 * 60            # CPI is a MAJOR event: window x1.5
+    assert news.window_for({**e, "impact": "medium"}, 30, 20, "high") is None
+    w = [(100, 200, "a", "high"), (500, 600, "b", "high")]
+    assert news.hit(w, 150)[0][2] == "a" and news.hit(w, 300) == (None, w[1]) and news.hit(w, 700) == (None, None)
+
+
+def test_news_feed_parse_store_and_gate():
+    from app import news, models
+    from app.database import SessionLocal, engine
+    models.Base.metadata.create_all(bind=engine)
+    rows = [{"title": "Core CPI m/m", "country": "USD", "date": "2026-10-14T08:30:00-04:00", "impact": "High", "forecast": "0.3%", "previous": "0.3%"},
+            {"title": "Bank Holiday", "country": "GBP", "date": "2026-10-14T00:00:00-04:00", "impact": "Holiday"}]
+    ev = news.parse_feed(rows)
+    assert len(ev) == 1 and ev[0]["ts"] == 1_791_981_000
+    db = SessionLocal()
+    try:
+        news.upsert(db, ev)
+        news.upsert(db, ev)                                                      # idempotent
+        got = news.events_between(db, "GC=F", 1_791_981_000 - 3600, 1_791_981_000 + 3600, "high")
+        assert len([g for g in got if g["source"] == "feed"]) == 1
+        wins = news.windows(db, "GC=F", 1_791_981_000 - 3600, 1_791_981_000 + 3600, level="high")
+        assert wins and wins[0][0] < 1_791_981_000 < wins[0][1]
+        assert not news.windows(db, "GC=F", 1_791_981_000 - 3600, 1_791_981_000 + 3600, level="off")
+    finally:
+        db.query(models.NewsEvent).delete()
+        db.commit()
+        db.close()
+
+
+def test_backtest_respects_news_blackout_and_has_diagnostics():
+    df, d1 = _demo_frames("EURUSD=X", "15m")
+    base = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", d1, 1.0, max_open=3, spread=0.0001)
+    assert base["total_trades"] > 0 and "diagnostics" in base
+    t0, t1 = int(df.index[0].timestamp()), int(df.index[-1].timestamp())
+    blocked = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", d1, 1.0, max_open=3, spread=0.0001,
+                              news_windows=[(t0, t1, "everything", "high")])
+    assert blocked["total_trades"] == 0
+    for t in base["trades"]:
+        if t["result"] == "win":
+            assert t["reward_r"] >= 1.2          # no more 1.0-1.1R 'wins'
+
+
+def test_room_gate_blocks_close_walls():
+    from app import strategy as S
+    class Ctx:  # minimal: one supply wall 1.2R above price
+        zones = [{"state": "fresh", "type": "supply", "bottom": 101.2, "top": 102}]
+        pools = []
+    d, why = S.realistic_target(Ctx, Ctx, S.BULL, 100.0, 1.0, 2.0, [], 1.5)
+    assert why.startswith("blocked") and abs(d - 1.2) < 1e-9
+    d, why = S.realistic_target(Ctx, Ctx, S.BULL, 100.0, 1.0, 2.0, [], 1.0)
+    assert not why.startswith("blocked")

@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal
 
 import numpy as np
@@ -13,6 +13,8 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from .. import auth, models, schemas, sessions, trades
+from .. import news as news_mod
+from .. import settings as settings_mod
 from .. import strategy as strat
 from ..confirm import candle_patterns
 from ..strategy import effective_min_agreement
@@ -208,11 +210,12 @@ CATCHUP_HOURS = 6                                        # how far back one scan
 
 
 def _make_cfg(style: str, rr: float, min_agreement: float, sessions_only: bool, entry_interval: str,
-              breakeven_at_r: float, sens: str = "normal") -> strat.Cfg:
+              breakeven_at_r: float, sens: str = "normal", news_windows: tuple = (), spread: float = 0.0) -> strat.Cfg:
     step = INTERVAL_SECONDS[entry_interval]
     return strat.Cfg(rr=rr, min_agreement=strat.min_agreement_for(min_agreement, rr, step, style, sens),
                      sessions_only=sessions_only, entry_seconds=step, entry_interval=entry_interval,
-                     breakeven_at_r=breakeven_at_r, style=style, **strat.engine_flags(style, sens))
+                     breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows), spread=spread,
+                     **strat.engine_flags(style, sens))
 
 
 def _plan_json(sig: dict) -> str:
@@ -329,7 +332,14 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
     ctx = strat.make_ctx(d4, d1)            # built once, shared by the swing and the scalp evaluation
     step = INTERVAL_SECONDS[entry_interval]
 
-    cfg = _make_cfg("swing", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens)
+    now_ts = int(time.time())
+    try:
+        nwin = news_mod.windows(db, symbol, now_ts - 3 * 86400, now_ts + 2 * 86400)
+    except Exception:  # noqa: BLE001 - the calendar must never take the signal down
+        log.exception("news windows failed")
+        nwin = []
+    spread = round(price * 0.0001, 6)                 # same ~1 basis point the backtest charges
+    cfg = _make_cfg("swing", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens, tuple(nwin), spread)
     sig, analysis = strat.build_signal(d4, d1, de, cfg, levels, sess_mask, market_ok, forming_bar=forming_bar,
                                        ctx=ctx, futures=futures)
     sig["min_agreement_requested"] = min_agreement
@@ -337,13 +347,35 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
 
     scalp_sig = scfg = None
     if scalp:
-        scfg = _make_cfg("scalp", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens)
+        scfg = _make_cfg("scalp", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens, tuple(nwin), spread)
         scalp_sig, _ = strat.build_signal(d4, d1, de, scfg, levels, sess_mask, market_ok, ctx=ctx, futures=futures)
         scalp_sig["min_agreement_effective"] = round(scfg.min_agreement, 1)
     if not market_ok:
         lag_min = round((status.get("lag_sec") or 0) / 60)
         sig["headline"] = (f"Price feed is ~{lag_min} min behind - signals paused until it catches up"
                            if status["market_open"] else "Market closed - no signals until it reopens")
+    cur_w, nxt_w = news_mod.hit(nwin, now_ts)
+    sig["news"] = {"blackout": ({"label": cur_w[2], "start": cur_w[0], "end": cur_w[1], "impact": cur_w[3]} if cur_w else None),
+                   "next": ({"label": nxt_w[2], "start": nxt_w[0], "end": nxt_w[1], "impact": nxt_w[3]} if nxt_w else None),
+                   "filter": settings_mod.news_prefs()["filter"]}
+    if persist:
+        try:
+            w_ = cur_w or (nxt_w if nxt_w and nxt_w[0] - now_ts <= 15 * 60 else None)
+            if w_ is not None:
+                title_ = f"News: {w_[2]}"[:120]
+                since_ = utcnow() - timedelta(hours=6)
+                if not db.query(models.Alert.id).filter(models.Alert.user_id == user.id, models.Alert.kind == "news",
+                                                        models.Alert.title == title_, models.Alert.created_at >= since_).first():
+                    mins = round((w_[0] - now_ts) / 60)
+                    db.add(models.Alert(user_id=user.id, kind="news", symbol=symbol, title=title_,
+                                        message=(f"Signals are paused for {symbol} around this release "
+                                                 f"({'starts in ' + str(mins) + ' min' if mins > 0 else 'blackout running'}, "
+                                                 f"until {datetime.fromtimestamp(w_[1], timezone.utc):%H:%M} UTC). Spreads and candles can jump.")))
+                    db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+    if cur_w and sig.get("status") not in ("market_closed", "signal"):
+        sig["headline"] = f"NEWS BLACKOUT - {cur_w[2]}: signals paused. " + str(sig.get("headline") or "")
     sess = sessions.session_state(futures=futures)
     sig["session"] = {"label": sess["label"], "active": sess["active"], "allowed": sess["trade_allowed"]}
 
@@ -442,6 +474,17 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
                         [{"direction": r_.direction, "entry": r_.entry_price, "plan": _jload(r_.plan_json, {})} for r_ in running],
                         {"direction": cand["direction"], "entry": cand["entry_price"], "sl": cand["stop_loss"], "zone": cand.get("zone")},
                         MAX_OPEN_PER_SYMBOL)
+                    if ok:
+                        cool = strat._tf_scale(step, strat.Cfg.cooldown_bars) * step
+                        lost = db.query(models.SignalRecord).filter(
+                            models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
+                            models.SignalRecord.direction == cand["direction"], models.SignalRecord.status == "lost",
+                            models.SignalRecord.closed_at != None).order_by(desc(models.SignalRecord.closed_at)).first()   # noqa: E711
+                        if lost is not None:
+                            lt = int(lost.closed_at.replace(tzinfo=timezone.utc).timestamp())
+                            ct = int(cand["candle_ts"])
+                            if lt <= ct < lt + cool:
+                                ok, why = False, "cool-down: the last same-direction trade just stopped out"
                     if not ok:
                         skipped.append(why)
                         continue
@@ -576,6 +619,7 @@ def replay_signals(
     sessions_only: bool = True,
     rr: float = Query(2.0, ge=0.5, le=10),
     days: int = Query(14, ge=1, le=365),
+    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
 ):
     """What the engine WOULD have said on every candle of the last `days` days, with how each signal went.
@@ -592,7 +636,8 @@ def replay_signals(
     if len(df) < 120 or len(df1) < strat.MIN_BARS["1h"]:
         return {"signals": [], "previews": [], "from_ts": None, "to_ts": None, "bars": 0}
     last_ts = int(df.index.as_unit("s").asi8[-1])
-    key = (symbol, entry_interval, style, sens, round(rr, 2), round(min_agreement), sessions_only, days, last_ts)
+    key = (symbol, entry_interval, style, sens, round(rr, 2), round(min_agreement), sessions_only, days, last_ts,
+           settings_mod.news_prefs()["filter"])
     hit = _REPLAY_CACHE.get(key)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
@@ -603,9 +648,12 @@ def replay_signals(
     lo = max(0, int(np.searchsorted(ts, from_ts)) - warm)
     sub = df.iloc[lo:]
     sig_out, prev_out, summaries = [], [], {}
+    nwin = news_mod.windows(db, symbol, from_ts - 86400, last_ts)
+    spread_ = round(float(df["Close"].iloc[-1]) * 0.0001, 6)
     for st_ in (["swing", "scalp"] if style == "both" else [style]):
         res = bt.run_backtest(sub, entry_interval, rr, min_agreement, sessions_only, symbol, df1, 1.0, style=st_,
-                              max_open=3 if st_ == "swing" else 2, fill="close", collect_previews=True, sens=sens)
+                              max_open=3 if st_ == "swing" else 2, fill="close", collect_previews=True, sens=sens,
+                              news_windows=nwin, spread=spread_)
         sig_out += [_slim_trade(t, st_) for t in res["trades"] if t["entry_ts"] >= from_ts]
         prev_out += [{**p_, "style": st_} for p_ in res.get("previews", []) if p_["ts"] >= from_ts]
         summaries[st_] = {k: res[k] for k in ("total_trades", "wins", "losses", "breakevens", "win_rate", "net_r", "avg_r")}

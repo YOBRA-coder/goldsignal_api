@@ -138,6 +138,7 @@ class BacktestRequest(BaseModel):
     spread: Optional[float] = None    # price units; None = automatic (about 1 basis point of price)
     slippage: float = 0.0
     realistic_fill: bool = True       # True: enter on the NEXT candle's open; False: at the signal candle's close
+    news: Optional[str] = None        # off | high | all  (None = the News setting in the app)
 
 
 class BacktestOut(BaseModel):
