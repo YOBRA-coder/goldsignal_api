@@ -195,3 +195,16 @@ class NewsEvent(Base):
     actual = Column(String, nullable=True)
     source = Column(String, default="feed")             # feed | manual
     created_at = Column(DateTime, default=utcnow)
+
+
+class PushSub(Base):
+    """A browser / installed-app push subscription: lets alerts reach the phone while the app is closed."""
+    __tablename__ = "push_subs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    endpoint = Column(String, unique=True, index=True)
+    p256dh = Column(String)
+    auth = Column(String)
+    ua = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow)

@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import models
 from .database import engine, ensure_columns
-from .routers import auth_router, signals_router, backtest_router, profile_router, market_router, alerts_router, news_router
+from .routers import auth_router, signals_router, backtest_router, profile_router, market_router, alerts_router, news_router, push_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -29,6 +29,7 @@ app.include_router(market_router.router)
 app.include_router(backtest_router.router)
 app.include_router(profile_router.router)
 app.include_router(news_router.router)
+app.include_router(push_router.router)
 
 
 @app.on_event("startup")
@@ -37,6 +38,8 @@ def _start_background_scanner():
     bg_scanner.start()
     from . import news
     news.start()
+    from . import push
+    push.install()
 
 
 @app.get("/")

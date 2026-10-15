@@ -24,3 +24,19 @@ a built-in schedule for NFP / FOMC / weekly claims (so backtests over past weeks
 `GOLDSIGNAL_NEWS=0` disables the refresher. Hard **news** gate: no new signals from 30 min before to 20 min after a high-impact release for the
 pair's currencies (CPI / NFP / FOMC / rate decisions x1.5). Settings: News page -> News protection. The same windows feed the live scan,
 the chart replay and the backtest. Alert "News: ..." 15 min before a release. Charts: the **News** layer (line, blackout band, price reaction).
+
+## v6 - installable PWA + background push
+
+The frontend is a full PWA: `manifest.webmanifest`, icons (incl. maskable + Apple touch), `sw.js` (offline app shell, "new version ready" banner;
+market data is never cached), install button (top bar + Profile -> "Install as an app", iPhone steps included).
+
+**Install needs https** (or `localhost` on the same computer):
+* Deploy: frontend on Vercel (`frontend/`, `npm run build`, env `VITE_API_URL=https://<your-backend>`), backend on Railway / a VPS
+  (`uvicorn app.main:app --host 0.0.0.0 --port $PORT`). Mount a volume for `goldsignal.db` and `cache/` (SQLite is wiped on redeploy otherwise).
+* Try it on a phone from your PC: `cloudflared tunnel --url http://localhost:5173` (or ngrok) gives an https URL.
+
+**Background alerts:** Profile -> Install as an app -> "Background alerts on this device". The backend encrypts and sends Web Push itself
+(`app/push.py`, no extra package) for every alert: signals, TP/SL, setups, news. The VAPID key is created on first start in `backend/vapid_private.pem`;
+on hosts with a wiped disk set `GOLDSIGNAL_VAPID_PEM` (PEM text, newlines as `\n`) so subscriptions survive redeploys.
+`GOLDSIGNAL_PUSH_SUBJECT=mailto:you@yourdomain.com` sets the contact; `GOLDSIGNAL_PUSH=0` turns sending off. iPhone: only after "Add to Home Screen" (iOS 16.4+).
+The server keeps scanning with the browser closed (`bg_scanner.py`), so alerts keep coming while the backend runs.

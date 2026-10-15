@@ -365,3 +365,35 @@ def test_room_gate_blocks_close_walls():
     assert why.startswith("blocked") and abs(d - 1.2) < 1e-9
     d, why = S.realistic_target(Ctx, Ctx, S.BULL, 100.0, 1.0, 2.0, [], 1.0)
     assert not why.startswith("blocked")
+
+
+# ------------------------------------------------------------- v6: web push (PWA)
+def test_web_push_encryption_roundtrip_and_vapid():
+    """Encrypt exactly like a browser expects, then decrypt the way a browser would (RFC 8291) and check the VAPID JWT."""
+    import base64, json as _j
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from app import push
+    ua = ec.generate_private_key(ec.SECP256R1())
+    ua_pub = ua.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    auth = b"0123456789abcdef"
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    msg = _j.dumps({"title": "TEST", "body": "héllo"}).encode()
+    body = push.encrypt(msg, b64(ua_pub), b64(auth))
+    salt, rs, idl = body[:16], int.from_bytes(body[16:20], "big"), body[20]
+    eph_pub, ct = body[21:21 + idl], body[21 + idl:]
+    shared = ua.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), eph_pub))
+    prk = push._hkdf(auth, shared, b"WebPush: info\x00" + ua_pub + eph_pub, 32)
+    cek, nonce = push._hkdf(salt, prk, b"Content-Encoding: aes128gcm\x00", 16), push._hkdf(salt, prk, b"Content-Encoding: nonce\x00", 12)
+    plain = AESGCM(cek).decrypt(nonce, ct, None)
+    assert rs == 4096 and plain.endswith(b"\x02") and plain[:-1] == msg
+    h = push._vapid_header("https://fcm.googleapis.com/fcm/send/abc")
+    t, k = h[len("vapid t="):].split(", k=")
+    hd, bd, sg = t.split(".")
+    raw = base64.urlsafe_b64decode(sg + "==")
+    pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), base64.urlsafe_b64decode(k + "=="))
+    pub.verify(encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")),
+               f"{hd}.{bd}".encode(), ec.ECDSA(hashes.SHA256()))
+    assert _j.loads(base64.urlsafe_b64decode(bd + "=="))["aud"] == "https://fcm.googleapis.com"
