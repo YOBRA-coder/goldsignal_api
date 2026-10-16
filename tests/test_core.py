@@ -448,3 +448,20 @@ def test_amd_engine_modes_selective_and_daily_stop_run():
         if t["result"] == "loss":
             by_day[t["exit_ts"] // 86400] = by_day.get(t["exit_ts"] // 86400, 0) + 1
     assert all(v <= 2 for v in by_day.values())          # a trade already running when the day's first stop-out happens may still lose
+
+
+def test_history_import_mt5_csv(tmp_path, monkeypatch):
+    import numpy as np, pandas as pd
+    monkeypatch.setenv("GOLDSIGNAL_CANDLE_DB", str(tmp_path / "c.db"))
+    from app import candle_store as cs, history_import as hi
+    idx = pd.date_range(end=pd.Timestamp.now("UTC").floor("5min").tz_localize(None) - pd.Timedelta(hours=1), periods=400, freq="5min")
+    px = 1.1 + np.cumsum(np.random.default_rng(1).normal(size=400)) * 1e-4
+    rows = []
+    for t, c in zip(idx, px):
+        l = t + pd.Timedelta(hours=3)
+        rows.append(f"{l:%Y.%m.%d},{l:%H:%M},{c-1e-4:.5f},{c+2e-4:.5f},{c-2e-4:.5f},{c:.5f},100,0")
+    r = hi.import_text("T=X", "5m", "\n".join(rows), 3)
+    assert r["rows_stored"] == 400 and cs.bounds("T=X", "5m")[0] == int(idx[0].timestamp())   # GMT+3 converted to UTC
+    import pytest
+    with pytest.raises(hi.ImportError_):
+        hi.import_text("T=X", "15m", "\n".join(rows), 3)                                       # wrong timeframe is refused

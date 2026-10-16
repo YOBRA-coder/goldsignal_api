@@ -56,7 +56,7 @@ SUPPORTED = list(INTERVAL_SECONDS)
 # 1m is the "live tape": every other timeframe is patched with it (see merge_live), so the
 # slower frames can be cached longer without the newest candle ever lagging.
 DEFAULT_PERIOD = {"1m": "5d", "5m": "59d", "15m": "59d", "30m": "59d",
-                  "1h": "365d", "1d": "2y", "1wk": "5y"}
+                  "1h": "729d", "1d": "2y", "1wk": "5y"}
 # the longest window Yahoo will serve per request - older history comes from candle_store (it accumulates)
 YF_MAX_DAYS = {"1m": 7, "5m": 59, "15m": 59, "30m": 59, "1h": 729, "1d": 7300, "1wk": 7300}
 TTL = {"1m": 12, "5m": 90, "15m": 120, "30m": 180, "1h": 300, "1d": 120, "1wk": 600}

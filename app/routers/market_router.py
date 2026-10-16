@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from pydantic import BaseModel
 
@@ -278,3 +278,23 @@ def analysis(
                                     sessions.session_state(futures=futures), entry_interval, futures, status)
     _READ_CACHE[key] = (_t.time(), out)
     return out
+
+
+@router.post("/import")
+async def import_history(request: Request, symbol: str, interval: Literal["1m", "5m", "15m", "30m", "1h", "1d"],
+                         tz_offset: float = Query(3.0, ge=-14, le=14, description="broker server time offset from UTC in hours (GMT+3 -> 3)"),
+                         user: models.User = Depends(auth.get_current_user)):
+    """Load candle history from a CSV (MT5 export) into the persistent store. Body = the file's text."""
+    from .. import data_fetcher, history_import
+    raw = await request.body()
+    if len(raw) > history_import.MAX_BYTES:
+        raise HTTPException(413, "File is larger than 80 MB - export a shorter period or a higher timeframe.")
+    if not raw.strip():
+        raise HTTPException(400, "The file is empty.")
+    try:
+        text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig", errors="replace")
+        res = history_import.import_text(symbol, interval, text, tz_offset)
+    except history_import.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    data_fetcher._mem.clear()          # so charts / backtests see the new history immediately
+    return res

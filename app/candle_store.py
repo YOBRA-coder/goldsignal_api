@@ -23,7 +23,7 @@ import pandas as pd
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache")
 STEP = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "1d": 86400, "1wk": 604800}
 # how long we keep each resolution (days) - bounded so the file stays small
-RETENTION_DAYS = {"1m": 21, "5m": 365, "15m": 730, "30m": 1100, "1h": 2200, "1d": 9999, "1wk": 9999}
+RETENTION_DAYS = {"1m": 35, "5m": 365, "15m": 730, "30m": 1100, "1h": 2200, "1d": 9999, "1wk": 9999}
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -86,6 +86,21 @@ def upsert(symbol: str, interval: str, df: pd.DataFrame, closed_before: float | 
         con.executemany("INSERT OR REPLACE INTO candles(symbol,interval,ts,o,h,l,c,v) VALUES (?,?,?,?,?,?,?,?)", rows)
         days = RETENTION_DAYS.get(interval, 9999)
         con.execute("DELETE FROM candles WHERE symbol=? AND interval=? AND ts < ?", (symbol, interval, int(time.time() - days * 86400)))
+        con.commit()
+    return len(rows)
+
+
+def write_rows(symbol: str, interval: str, df: pd.DataFrame) -> int:
+    """Store EVERY row of `df` (an import): unlike upsert() it also writes older rows. Existing rows are replaced."""
+    if df is None or df.empty or interval not in STEP:
+        return 0
+    ts = df.index.as_unit("s").asi8
+    rows = list(zip([symbol] * len(df), [interval] * len(df), ts.tolist(), df["Open"].astype(float).tolist(),
+                    df["High"].astype(float).tolist(), df["Low"].astype(float).tolist(), df["Close"].astype(float).tolist(),
+                    df["Volume"].fillna(0).astype(float).tolist()))
+    with _lock:
+        con = _db()
+        con.executemany("INSERT OR REPLACE INTO candles(symbol,interval,ts,o,h,l,c,v) VALUES (?,?,?,?,?,?,?,?)", rows)
         con.commit()
     return len(rows)
 
