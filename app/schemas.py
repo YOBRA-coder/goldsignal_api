@@ -139,6 +139,9 @@ class BacktestRequest(BaseModel):
     slippage: float = 0.0
     realistic_fill: bool = True       # True: enter on the NEXT candle's open; False: at the signal candle's close
     news: Optional[str] = None        # off | high | all  (None = the News setting in the app)
+    amd: Optional[str] = None         # off | confirm | require (None = the Engine setting in the app)
+    quality: Optional[str] = None     # standard | selective
+    daily_stop: Optional[int] = None  # stop-outs per day before the pair is paused (0 = off)
 
 
 class BacktestOut(BaseModel):

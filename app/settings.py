@@ -17,7 +17,8 @@ _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "settings
 _lock = threading.Lock()
 _state: dict | None = None
 DEFAULTS = {"anchor": "ny_close", "offsets": {}, "offset_set_at": {},
-            "news": {"filter": "high", "before": 30, "after": 20}}
+            "news": {"filter": "high", "before": 30, "after": 20},
+            "engine": {"amd": "confirm", "quality": "standard", "daily_stop": 2}}
 
 
 def _load() -> dict:
@@ -87,5 +88,24 @@ def set_news_prefs(filter: str | None = None, before: int | None = None, after: 
         if after is not None:
             cur["after"] = max(0, min(240, int(after)))
         _load()["news"] = cur
+        _save()
+        return dict(cur)
+
+
+def engine_prefs() -> dict:
+    with _lock:
+        return {**DEFAULTS["engine"], **(_load().get("engine") or {})}
+
+
+def set_engine_prefs(amd: str | None = None, quality: str | None = None, daily_stop: int | None = None) -> dict:
+    with _lock:
+        cur = {**DEFAULTS["engine"], **(_load().get("engine") or {})}
+        if amd in ("off", "confirm", "require"):
+            cur["amd"] = amd
+        if quality in ("standard", "selective"):
+            cur["quality"] = quality
+        if daily_stop is not None:
+            cur["daily_stop"] = max(0, min(10, int(daily_stop)))
+        _load()["engine"] = cur
         _save()
         return dict(cur)

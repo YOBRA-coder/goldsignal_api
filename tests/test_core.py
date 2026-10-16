@@ -397,3 +397,54 @@ def test_web_push_encryption_roundtrip_and_vapid():
     pub.verify(encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")),
                f"{hd}.{bd}".encode(), ec.ECDSA(hashes.SHA256()))
     assert _j.loads(base64.urlsafe_b64decode(bd + "=="))["aud"] == "https://fcm.googleapis.com"
+
+
+# ------------------------------------------------------------- v7: AMD, selective quality, daily stop, compare
+def _amd_frame(sweep="low", n=150, seed=4):
+    import numpy as np
+    from app.structure import Bars
+    rng = np.random.default_rng(seed)
+    c = np.zeros(n); c[0] = 100
+    for k in range(1, n):
+        if k < 30: c[k] = c[k - 1] + rng.normal(0, .35)
+        elif k < 75: c[k] = 100 + 0.55 * np.sin(k / 2.5) + rng.normal(0, .22)       # the accumulation range
+        elif k == 75: c[k] = 99.4 if sweep == "low" else 100.7
+        elif k < 82: c[k] = 100 + (k - 75) * (0.18 if sweep == "low" else -0.18)
+        else: c[k] = c[k - 1] + (0.5 if sweep == "low" else -0.5)                  # distribution
+    o = np.r_[c[0], c[:-1]]
+    h = np.maximum(o, c) + 0.2; l = np.minimum(o, c) - 0.2
+    if sweep == "low": l[75] = 97.8
+    else: h[75] = 102.3
+    idx = pd.date_range("2026-10-01", periods=n, freq="15min", tz="UTC")
+    return Bars(pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c, "Volume": 0.0}, index=idx))
+
+
+def test_amd_detects_raid_and_displacement_both_ways():
+    from app.amd import amd_state
+    for sweep, d in (("low", 1), ("high", -1)):
+        b = _amd_frame(sweep)
+        mid = amd_state(b, 78)
+        assert mid["phase"] in ("manipulation", "distribution") and mid["dir"] == d and mid["sweep"]["side"] == sweep
+        late = amd_state(b, 95)
+        assert late["phase"] == "distribution" and late["dir"] == d
+        assert amd_state(b, 70)["dir"] == 0                                  # nothing looks ahead: before the raid there is no trap
+    b = _amd_frame("low")
+    assert amd_state(b, 78)["top"] == amd_state(b, 95)["top"]
+
+
+def test_amd_engine_modes_selective_and_daily_stop_run():
+    df, d1 = _demo_frames("EURUSD=X", "15m")
+    kw = dict(max_open=3, spread=0.0001)
+    base = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", d1, 1.0, amd_mode="off", quality="standard", daily_stop=0, **kw)
+    req = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", d1, 1.0, amd_mode="require", quality="standard", daily_stop=0, **kw)
+    assert req["total_trades"] <= base["total_trades"]
+    assert all(t["amd"] == "aligned" for t in req["trades"])
+    sel = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", d1, 1.0, amd_mode="off", quality="selective", daily_stop=0, **kw)
+    assert sel["total_trades"] <= base["total_trades"]
+    ds = bt.run_backtest(df, "15m", 2.0, 60, False, "EURUSD=X", d1, 1.0, amd_mode="off", quality="standard", daily_stop=1, **kw)
+    assert ds["total_trades"] <= base["total_trades"]
+    by_day = {}
+    for t in ds["trades"]:
+        if t["result"] == "loss":
+            by_day[t["exit_ts"] // 86400] = by_day.get(t["exit_ts"] // 86400, 0) + 1
+    assert all(v <= 2 for v in by_day.values())          # a trade already running when the day's first stop-out happens may still lose

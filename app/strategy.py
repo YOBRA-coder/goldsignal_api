@@ -24,6 +24,7 @@ import pandas as pd
 
 from . import confirm as cf
 from . import news as _news
+from .amd import amd_state
 from . import sessions as _sessions
 from .indicators import ind
 from .structure import (BULL, BEAR, Bars, _pattern_from_ohlc, analyze_structure, base_zones, bias_name,
@@ -106,6 +107,9 @@ class Cfg:
     news_windows: tuple = ()     # ((start_ts, end_ts, label, impact), ...) high-impact news blackout, see news.py
     spread: float = 0.0          # price units; with max_cost_r it rejects trades where the spread alone eats too much of the risk
     max_cost_r: float = 0.15
+    amd_mode: str = "confirm"    # off | confirm (AMD adds a confirmation / a counter-AMD trigger needs one more) | require (must be aligned)
+    quality: str = "standard"    # standard | selective (1H premium/discount location + momentum are hard gates, +5 agreement)
+    daily_stop: int = 2          # stop signalling a pair for the rest of the (UTC) day after this many stop-outs (0 = off)
     cooldown_bars: int = 6       # after a stop-out, no new entry in the SAME direction for this many bars (x tf scale)
 
 
@@ -551,6 +555,18 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         need += 1                      # a gap-only tap is the weaker zone: ask for one more reason
     if against_htf:
         need += 1                      # a scalp that fights the 4H must be backed by one more reason
+    # ---- AMD (accumulation -> manipulation -> distribution) on the entry timeframe, read only when a trigger exists
+    amd = None
+    amd_aligned = amd_counter = False
+    if pat_ok and cfg.amd_mode != "off":
+        amd = amd_state(be, i)
+        live_ph = amd["phase"] in ("manipulation", "distribution")
+        amd_aligned = bool(live_ph and amd["dir"] == d)
+        amd_counter = bool(live_ph and amd["dir"] == -d)
+        if amd_aligned:
+            conf.append(f"AMD: {amd['sweep']['side']} of the range raided, now {amd['phase']}")
+        elif amd_counter:
+            need += 1                  # the range's trap points the OTHER way: ask for one more reason
     confluence_ok = bool(pat_ok and len(conf) >= need)
     _add(checks, "confluence", (f"At least {need} independent confirmation{'s' if need > 1 else ''} behind the trigger candle"
                                 if cfg.ext_confirms or need > 1 else
@@ -592,7 +608,19 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     _add(checks, "momentum", f"{tf_e} momentum agrees with direction", 4, (mom["agree"] if mom else None),
          (f"{'Upside' if d == BULL else 'Downside'} push confirms it - {abs(mom['roc_atr']):.2f}x ATR over the last bars"
           if mom and mom["agree"] else f"Momentum stalling / against direction ({mom['roc_atr']:.2f}x ATR)" if mom
-          else "Not enough bars for a momentum read"), 1.5, False, tf_e)
+          else "Not enough bars for a momentum read"), 1.5, cfg.quality == "selective", tf_e)
+
+    if cfg.amd_mode != "off":
+        if amd is not None:
+            _add(checks, "amd", "AMD: accumulation -> manipulation -> distribution agrees", 4,
+                 True if amd_aligned else (False if amd_counter else None),
+                 (f"{amd['note']} - same direction as this trade" if amd_aligned else
+                  f"{amd['note']} - but it points the OTHER way" if amd_counter else
+                  amd.get("note") or "No fresh range-raid-displacement sequence on this timeframe"),
+                 1.5 if amd_aligned else 0.5, cfg.amd_mode == "require", tf_e)
+        elif cfg.amd_mode == "require":
+            _add(checks, "amd", "AMD: accumulation -> manipulation -> distribution agrees", 4, None,
+                 "Pending trigger candle", 0.0, True, tf_e)
 
     volr = _volatility_regime(be, i)
     _add(checks, "volatility", f"{tf_e} volatility is tradeable (no extreme spike)", 4,
@@ -815,7 +843,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     eq1 = h1.st["eq"]
     pd_ok = bool(eq1 is not None and bias_ok and (price < eq1 if d == BULL else price > eq1))
     _add(checks, "pd_1h", "Discount (buys) / premium (sells) of 1H range", 3, pd_ok,
-         ("In 1H discount" if d == BULL else "In 1H premium") if pd_ok else "On the wrong side of the 1H range", 1.0, False, "1H")
+         ("In 1H discount" if d == BULL else "In 1H premium") if pd_ok else "On the wrong side of the 1H range", 1.0, cfg.quality == "selective", "1H")
 
     # ---- STEP 4 soft checks (bos/vs already computed above, alongside the confluence gate)
     _add(checks, "mini_bos", f"Mini BOS on {tf_e}", 4, bos is not None,
@@ -836,7 +864,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         grade = "A" if grade == "A+" else "B"
 
     gates_ok = all(c["ok"] for c in checks if c["gate"])
-    fired = gates_ok and agreement >= cfg.min_agreement
+    min_ag = cfg.min_agreement + (5.0 if cfg.quality == "selective" else 0.0)
+    fired = gates_ok and agreement >= min_ag
 
     # ---- status / headline
     if not market_ok:
@@ -860,11 +889,11 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         # a mandatory gate the headline chain above does not name (anti-chase RSI, or too little backing behind the
         # trigger candle) - say THAT, not "low agreement" (the old text blamed the score even when the score was fine)
         bad = next(c for c in checks if c["gate"] and not c["ok"])
-        status = {"extension": "stretched", "confluence": "needs_confirmation", "room": "no_room", "news": "news", "cost": "blocked",
+        status = {"extension": "stretched", "confluence": "needs_confirmation", "room": "no_room", "news": "news", "cost": "blocked", "amd": "amd_against",
                   "chop": "choppy"}.get(bad["key"], "blocked")
         head = f"Trigger present but blocked: {bad['detail']}"
     elif not fired:
-        status, head = "low_agreement", f"Trigger present but agreement {agreement:.1f}% < {cfg.min_agreement:.1f}% minimum"
+        status, head = "low_agreement", f"Trigger present but agreement {agreement:.1f}% < {min_ag:.1f}% minimum"
     else:
         status = "signal"
         head = f"{'Scalp ' if scalp else ''}{'BUY' if d == BULL else 'SELL'} - {pattern['label']} in {ztf} {tapped['source']}" \
@@ -918,6 +947,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         "h1_preview": h1_preview, "one_h_preview": one_h_preview, "entry_shift_preview": entry_shift_preview,
         "counter_watch": counter_watch, "momentum": mom, "volatility": volr, "highlights": highlights,
         "candle_ts": t, "signal_time": t + cfg.entry_seconds, "candle_idx": i,
+        "amd": amd, "amd_tag": ("aligned" if amd_aligned else "against" if amd_counter else "none"),
         "d": d, "zone_ok": zone_ok, "pat_ok": pat_ok, "zone_tf": ztf if zone_ok else None,
         "zone": {**zone_json(zbars, tapped), "tf": ztf} if tapped else None, "watch_zone": watch,
         "pattern": ({**pattern, "ts": t} if pattern else None),
@@ -1247,7 +1277,12 @@ def own_structure(df: pd.DataFrame, tf: str) -> dict | None:
         return None
     k = 3 if tf in ("4h", "1d", "1w") else 2
     ctx = TfCtx(df, k, k)
-    return tf_json(ctx, float(ctx.b.c[-1]), tf)
+    out = tf_json(ctx, float(ctx.b.c[-1]), tf)
+    try:
+        out["amd"] = amd_state(ctx.b, ctx.b.n - 1)
+    except Exception:  # noqa: BLE001 - an overlay extra must never break the chart payload
+        out["amd"] = None
+    return out
 
 
 def quick_bias(df: pd.DataFrame, left: int = 2) -> dict:

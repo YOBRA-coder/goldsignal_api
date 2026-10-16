@@ -215,7 +215,8 @@ def _make_cfg(style: str, rr: float, min_agreement: float, sessions_only: bool, 
     return strat.Cfg(rr=rr, min_agreement=strat.min_agreement_for(min_agreement, rr, step, style, sens),
                      sessions_only=sessions_only, entry_seconds=step, entry_interval=entry_interval,
                      breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows), spread=spread,
-                     **strat.engine_flags(style, sens))
+                     amd_mode=settings_mod.engine_prefs()["amd"], quality=settings_mod.engine_prefs()["quality"],
+                     daily_stop=settings_mod.engine_prefs()["daily_stop"], **strat.engine_flags(style, sens))
 
 
 def _plan_json(sig: dict) -> str:
@@ -354,6 +355,11 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
         lag_min = round((status.get("lag_sec") or 0) / 60)
         sig["headline"] = (f"Price feed is ~{lag_min} min behind - signals paused until it catches up"
                            if status["market_open"] else "Market closed - no signals until it reopens")
+    try:
+        from ..amd import amd_state
+        sig["amd_now"] = amd_state(Bars(de.tail(400)), min(len(de.tail(400)), 400) - 1)
+    except Exception:  # noqa: BLE001 - informational only
+        sig["amd_now"] = None
     cur_w, nxt_w = news_mod.hit(nwin, now_ts)
     sig["news"] = {"blackout": ({"label": cur_w[2], "start": cur_w[0], "end": cur_w[1], "impact": cur_w[3]} if cur_w else None),
                    "next": ({"label": nxt_w[2], "start": nxt_w[0], "end": nxt_w[1], "impact": nxt_w[3]} if nxt_w else None),
@@ -485,6 +491,14 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
                             ct = int(cand["candle_ts"])
                             if lt <= ct < lt + cool:
                                 ok, why = False, "cool-down: the last same-direction trade just stopped out"
+                    if ok and cfg.daily_stop > 0:
+                        day0 = int(time.time()) - int(time.time()) % 86400
+                        n_lost = db.query(models.SignalRecord.id).filter(
+                            models.SignalRecord.user_id == user.id, models.SignalRecord.symbol == symbol,
+                            models.SignalRecord.status == "lost", models.SignalRecord.closed_at != None,   # noqa: E711
+                            models.SignalRecord.closed_at >= datetime.fromtimestamp(day0, timezone.utc).replace(tzinfo=None)).count()
+                        if n_lost >= cfg.daily_stop:
+                            ok, why = False, f"daily stop: {n_lost} stop-outs on {symbol} today - done for the day"
                     if not ok:
                         skipped.append(why)
                         continue
@@ -637,7 +651,7 @@ def replay_signals(
         return {"signals": [], "previews": [], "from_ts": None, "to_ts": None, "bars": 0}
     last_ts = int(df.index.as_unit("s").asi8[-1])
     key = (symbol, entry_interval, style, sens, round(rr, 2), round(min_agreement), sessions_only, days, last_ts,
-           settings_mod.news_prefs()["filter"])
+           settings_mod.news_prefs()["filter"], tuple(settings_mod.engine_prefs().values()))
     hit = _REPLAY_CACHE.get(key)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
@@ -652,7 +666,8 @@ def replay_signals(
     spread_ = round(float(df["Close"].iloc[-1]) * 0.0001, 6)
     for st_ in (["swing", "scalp"] if style == "both" else [style]):
         res = bt.run_backtest(sub, entry_interval, rr, min_agreement, sessions_only, symbol, df1, 1.0, style=st_,
-                              max_open=3 if st_ == "swing" else 2, fill="close", collect_previews=True, sens=sens,
+                              max_open=3 if st_ == "swing" else 2, fill="close", collect_previews=True, sens=sens, amd_mode=settings_mod.engine_prefs()["amd"], quality=settings_mod.engine_prefs()["quality"],
+                              daily_stop=settings_mod.engine_prefs()["daily_stop"],
                               news_windows=nwin, spread=spread_)
         sig_out += [_slim_trade(t, st_) for t in res["trades"] if t["entry_ts"] >= from_ts]
         prev_out += [{**p_, "style": st_} for p_ in res.get("previews", []) if p_["ts"] >= from_ts]

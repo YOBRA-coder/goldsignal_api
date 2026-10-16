@@ -107,10 +107,10 @@ def diagnostics(trades: list[dict]) -> dict:
         "avg_bars_win": round(sum(t.get("bars_held", 0) for t in cl if t["result"] == "win") / max(1, len(wins)), 1),
         "avg_bars_loss": round(sum(t.get("bars_held", 0) for t in lo) / max(1, len(lo)), 1),
         "by_agreement": ag, "by_grade": bucket(lambda t: t.get("grade")), "by_pattern": bucket(lambda t: t.get("pattern")),
-        "by_zone": bucket(lambda t: t.get("zone")), "by_session": bucket(lambda t: t.get("session")),
+        "by_zone": bucket(lambda t: t.get("zone")), "by_amd": bucket(lambda t: t.get("amd")), "by_session": bucket(lambda t: t.get("session")),
     }
     weak = []
-    for name in ("by_agreement", "by_grade", "by_pattern", "by_zone", "by_session"):
+    for name in ("by_agreement", "by_grade", "by_pattern", "by_zone", "by_session", "by_amd"):
         for k, b in out[name].items():
             if b["trades"] >= 8 and b["net_r"] < -2.0:
                 weak.append({"group": name[3:], "key": k, "trades": b["trades"], "win_rate": b["win_rate"], "net_r": b["net_r"]})
@@ -169,7 +169,8 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
                  min_agreement: float = 70.0, sessions_only: bool = True, symbol: str = "GC=F",
                  df_1h: pd.DataFrame | None = None, breakeven_at_r: float = 1.0, style: str = "swing",
                  max_open: int = 1, spread: float = 0.0, slippage: float = 0.0, fill: str = "next_open",
-                 collect_previews: bool = False, news_windows=(), **cfg_extra) -> dict:
+                 collect_previews: bool = False, news_windows=(), amd_mode: str = "confirm", quality: str = "standard",
+                 daily_stop: int = 2, **cfg_extra) -> dict:
     """df_1h: real hourly history used to build the 1H/4H context, exactly like the live engine. Without it the
     1H/4H bars are derived from the entry candles.
     breakeven_at_r: once a trade is this many R in favor, its stop moves to entry (0 disables it).
@@ -183,7 +184,8 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
     flags = {**engine_flags(style, sens), **cfg_extra}
     eff_min = min_agreement_for(min_agreement, risk_reward, step, style, flags.get("sens", sens))
     cfg = Cfg(rr=risk_reward, min_agreement=eff_min, sessions_only=sessions_only, entry_seconds=step,
-              entry_interval=entry_interval, breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows or ()), spread=spread, **flags)
+              entry_interval=entry_interval, breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows or ()), spread=spread, amd_mode=amd_mode, quality=quality,
+              daily_stop=daily_stop, **flags)
     df1 = df_1h if df_1h is not None else _resample_1h(df_entry)
     df4 = resample_ohlc(df1, "4h", symbol)
     end1 = df1.index.as_unit("s").asi8 + 3600
@@ -198,7 +200,7 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
 
     trades: list[dict] = []
     previews: list[dict] = []
-    skipped = {"missed_fill": 0, "overlap": 0, "cooldown": 0}
+    skipped = {"missed_fill": 0, "overlap": 0, "cooldown": 0, "daily_stop": 0}
     last_loss: dict[str, int] = {}      # direction -> exit_ts of the last stop-out (cool-down: no instant re-entry)
     cool_s = _tf_scale(step, cfg.cooldown_bars) * step
     open_ts: list[dict] = []            # trades whose exit is still ahead of the current candle
@@ -268,12 +270,18 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
         if cool_s and direction in last_loss and last_loss[direction] <= int(ts_arr[i]) < last_loss[direction] + cool_s:
             skipped["cooldown"] += 1
             continue
+        if daily_stop > 0:                      # circuit breaker: N stop-outs already booked today -> done for the day
+            day0 = int(ts_arr[i]) - int(ts_arr[i]) % 86400
+            lost_today = sum(1 for q in trades if q["result"] == "loss" and day0 <= q["exit_ts"] <= int(ts_arr[i]))
+            if lost_today >= daily_stop:
+                skipped["daily_stop"] += 1
+                continue
         cand = {"entry_ts": int(ts_arr[i]), "direction": direction, "entry": entry, "signal_entry": sig_entry,
                 "sl": sl, "tp": tp, "agreement": res["agreement"], "grade": res["grade"], "session": tags[i],
                 "pattern": (res["pattern"] or {}).get("type"), "zone": (res["zone"] or {}).get("source"),
                 "zone_tf": (res["zone"] or {}).get("tf"), "risk0": risk,
                 "reward_r": round(abs(tp - entry) / risk, 3), "be_moved": False, "style": style,
-                "trade_type": res.get("trade_type"), "confirms": res.get("confirm_count"),
+                "trade_type": res.get("trade_type"), "amd": res.get("amd_tag"), "confirms": res.get("confirm_count"),
                 "confirmations": res.get("confirmations"), "headline": res.get("headline")}
         if open_ts:
             ok, _why = can_open([{"direction": t["direction"], "entry": t["entry"], "sl": t["sl"]} for t in open_ts],

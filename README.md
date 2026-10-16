@@ -40,3 +40,16 @@ market data is never cached), install button (top bar + Profile -> "Install as a
 on hosts with a wiped disk set `GOLDSIGNAL_VAPID_PEM` (PEM text, newlines as `\n`) so subscriptions survive redeploys.
 `GOLDSIGNAL_PUSH_SUBJECT=mailto:you@yourdomain.com` sets the contact; `GOLDSIGNAL_PUSH=0` turns sending off. iPhone: only after "Add to Home Screen" (iOS 16.4+).
 The server keeps scanning with the browser closed (`bg_scanner.py`), so alerts keep coming while the backend runs.
+
+## v7 - AMD (accumulation -> manipulation -> distribution) + loss minimisation
+
+* `app/amd.py` - works on ANY timeframe, point-in-time (no look-ahead): a tight range (<= 3.2 ATR, low efficiency, both edges respected) ->
+  a raid of one edge that closes back inside within 3 bars (the trap) -> displacement through the range midpoint (distribution).
+  Chart layer **AMD** draws the range, the raid (M) and the displacement (D) for the timeframe you are viewing; the Log panel shows the current phase.
+* Engine switch **AMD**: off / confirm (an aligned sequence is an extra confirmation, a counter-sequence needs one more) / required (only aligned setups).
+* Engine switch **Quality**: standard / selective (1H discount-premium location and momentum become hard gates, agreement +5).
+* **Daily stop**: after N stop-outs on a pair the engine pauses it for the rest of the UTC day (live and backtest).
+* Backtest -> **Compare settings**: six engine settings on the same candles, costs and news windows, plus the last 30% of the period judged separately
+  (out-of-sample). The best one is the highest net R per drawdown among settings that also made money in the last 30%; "Use live" applies it.
+  If nothing profits it says so - that is information about the pair / timeframe / style, not a bug.
+* Settings are saved server-side (`settings.json`): `GET/PUT /engine/settings`.
