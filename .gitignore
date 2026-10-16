@@ -4,3 +4,6 @@ cache/
 __pycache__/
 *.pyc
 *.db
+goldsignal.db
+settings.json
+vapid_private.pem
