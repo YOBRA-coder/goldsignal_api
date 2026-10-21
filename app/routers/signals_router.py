@@ -9,6 +9,7 @@ from typing import List, Literal
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
@@ -297,6 +298,35 @@ def _setup_alert(db: Session, user: models.User, symbol: str, entry_interval: st
     state.last_setup_ts = now
 
 
+def _snapshot(sig: dict, price: float) -> dict:
+    """The few fields the Alerts board needs to say what a pair is doing (kept small: one per scan-log row)."""
+    zone = sig.get("zone") or sig.get("watch_zone")
+    fm = sig.get("forming") or {}
+    return {"price": price, "stage": sig.get("stage"), "trade_type": sig.get("trade_type"), "grade": sig.get("grade"),
+            "entry": sig.get("entry_price"), "sl": sig.get("stop_loss"), "tp": sig.get("take_profit"), "rr": sig.get("rr"),
+            "zone": ({k: zone.get(k) for k in ("top", "bottom", "tf", "source", "type", "distance_atr")} if zone else None),
+            "zone_tapped": bool(sig.get("zone_ok")), "trigger_ready": bool(sig.get("pat_ok")),
+            "pattern": (sig.get("pattern") or {}).get("label") if isinstance(sig.get("pattern"), dict) else sig.get("pattern"),
+            "forming": fm.get("status"), "session": (sig.get("session") or {}).get("label"),
+            "amd": (sig.get("amd_now") or {}).get("phase") if isinstance(sig.get("amd_now"), dict) else None}
+
+
+# status -> board category. signal = fired; setup = zone tapped / trigger stage (something is nearly there);
+# watch = bias is clear, waiting for price to reach a zone; aside = nothing to do on this pair right now.
+_SETUP = {"waiting_trigger", "needs_confirmation", "low_agreement", "out_of_session", "risk_too_wide", "stretched",
+          "no_room", "blocked", "amd_against", "choppy", "news"}
+
+
+def board_category(status: str | None) -> str:
+    if status == "signal":
+        return "signal"
+    if status in _SETUP:
+        return "setup"
+    if status == "waiting_zone":
+        return "watch"
+    return "aside"
+
+
 def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interval: str = "15m",
              min_agreement: float = 70, sessions_only: bool = True, rr: float = 2.0, breakeven_at_r: float = 1.0,
              scalp: bool = False, sens: str = "normal", persist: bool = True, background: bool = False,
@@ -404,7 +434,8 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
             headline=sig["headline"], direction=sig["direction"] if sig["direction"] in ("BUY", "SELL") else None,
             bias_4h=sig["bias_4h"], bias_1h=sig["bias_1h"], agreement=sig["agreement"], grade=sig.get("grade"),
             momentum_agree=(sig.get("momentum") or {}).get("agree"), volatility_spike=(sig.get("volatility") or {}).get("spike"),
-            checks_json=json.dumps(sig["checks"]), previews_json=json.dumps(previews, default=str)))
+            checks_json=json.dumps(sig["checks"]), previews_json=json.dumps(previews, default=str),
+            snapshot_json=json.dumps(_snapshot(sig, price), default=str)))
         stale = db.query(models.ScanLog.id).filter(
             models.ScanLog.user_id == user.id, models.ScanLog.symbol == symbol,
             models.ScanLog.entry_interval == entry_interval).order_by(desc(models.ScanLog.ts)).offset(500).all()
@@ -707,8 +738,127 @@ def scan_log(
         if detail:
             row["checks"] = json.loads(r.checks_json) if r.checks_json else []
             row["previews"] = json.loads(r.previews_json) if r.previews_json else {}
+        if r.snapshot_json:
+            row["snapshot"] = json.loads(r.snapshot_json)
         out.append(row)
     return out
+
+
+# ---------------------------------------------------------------------- board / activity / peek (Alerts page)
+def _ts(dt) -> int:
+    return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
+
+@router.get("/board")
+def board(
+    symbols: str,
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """What every pair is doing right now, read from the scanner's latest evaluation (cheap: no market data calls).
+    Opening this also tells the background scanner the pairs are still wanted, so they stay fresh."""
+    syms = [x for x in dict.fromkeys(symbols.split(",")) if x][:40]
+    now = utcnow()
+    db.query(models.ScanState).filter(models.ScanState.user_id == user.id, models.ScanState.symbol.in_(syms),
+                                      models.ScanState.entry_interval == entry_interval).update(
+        {models.ScanState.seen_at: now}, synchronize_session=False)
+    db.commit()
+    open_by = {}
+    for r_ in db.query(models.SignalRecord).filter(models.SignalRecord.user_id == user.id, models.SignalRecord.status == "open").all():
+        open_by.setdefault(r_.symbol, []).append(r_)
+    rows = []
+    for sym in syms:
+        r = db.query(models.ScanLog).filter(models.ScanLog.user_id == user.id, models.ScanLog.symbol == sym,
+                                            models.ScanLog.entry_interval == entry_interval).order_by(desc(models.ScanLog.ts)).first()
+        trades_ = [{"id": t.id, "direction": t.direction, "entry": t.entry_price, "sl": t.stop_loss, "tp": t.take_profit,
+                    "r": None, "created_at": _ts(t.created_at)} for t in open_by.get(sym, [])]
+        if r is None:
+            rows.append({"symbol": sym, "scanned": False, "category": "none", "open_trades": trades_})
+            continue
+        rows.append({"symbol": sym, "scanned": True, "ts": _ts(r.ts), "status": r.status, "category": board_category(r.status),
+                     "headline": r.headline, "direction": r.direction, "bias_4h": r.bias_4h, "bias_1h": r.bias_1h,
+                     "agreement": r.agreement, "grade": r.grade, "entry_interval": r.entry_interval,
+                     "snapshot": json.loads(r.snapshot_json) if r.snapshot_json else None, "open_trades": trades_})
+    return {"entry_interval": entry_interval, "rows": rows, "now": int(time.time())}
+
+
+class BoardScanBody(BaseModel):
+    symbols: List[str]
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m"
+    min_agreement: float = 70
+    sessions_only: bool = True
+    rr: float = 2.0
+    scalp: bool = False
+    sens: Literal["strict", "normal", "high"] = "normal"
+
+
+@router.post("/board/scan")
+def board_scan(body: BoardScanBody, db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
+    """Evaluate the given pairs now (same engine, same signals / alerts as the dashboard). The page sends a few at a time."""
+    done, failed = [], {}
+    for sym in body.symbols[:6]:
+        try:
+            run_scan(db, user, sym, body.entry_interval, body.min_agreement, body.sessions_only, body.rr, 1.0, body.scalp, body.sens,
+                     persist=True, background=False, log_scan=True, track=True)
+            done.append(sym)
+        except DataUnavailable as e:
+            failed[sym] = str(e)[:160]
+        except HTTPException as e:
+            failed[sym] = str(e.detail.get("message") if isinstance(e.detail, dict) else e.detail)[:160]
+        except Exception as e:  # noqa: BLE001 - one bad pair must not stop the others
+            db.rollback()
+            failed[sym] = f"{type(e).__name__}: {e}"[:160]
+    return {"done": done, "failed": failed}
+
+
+@router.get("/activity")
+def activity(
+    hours: int = Query(24, ge=1, le=72),
+    limit: int = Query(80, ge=1, le=300),
+    symbol: str | None = None,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """The engine's activity feed: every time a pair CHANGED state (watch -> setup, setup -> signal, ...), newest first."""
+    q = db.query(models.ScanLog).filter(models.ScanLog.user_id == user.id, models.ScanLog.ts >= utcnow() - timedelta(hours=hours))
+    if symbol:
+        q = q.filter(models.ScanLog.symbol == symbol)
+    rows = q.order_by(models.ScanLog.symbol, models.ScanLog.entry_interval, models.ScanLog.ts).limit(12000).all()
+    out, prev = [], {}
+    for r in rows:
+        key = (r.symbol, r.entry_interval)
+        cat = board_category(r.status)
+        before = prev.get(key)
+        prev[key] = cat
+        if before is None or before == cat:
+            continue
+        out.append({"ts": _ts(r.ts), "symbol": r.symbol, "entry_interval": r.entry_interval, "from": before, "to": cat,
+                    "status": r.status, "direction": r.direction, "agreement": r.agreement, "grade": r.grade,
+                    "headline": r.headline, "snapshot": json.loads(r.snapshot_json) if r.snapshot_json else None})
+    out.sort(key=lambda x: -x["ts"])
+    return out[:limit]
+
+
+@router.get("/peek")
+def peek(
+    symbol: str = "GC=F",
+    entry_interval: Literal["1m", "5m", "15m", "30m"] = "15m",
+    min_agreement: float = Query(70, ge=0, le=100),
+    sessions_only: bool = True,
+    rr: float = Query(2.0, ge=0.5, le=10),
+    sens: Literal["strict", "normal", "high"] = "normal",
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Read-only analysis of ANY pair for the pop-up chart: nothing is saved, no alerts, no trade tracking."""
+    try:
+        out = run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, 1.0, False, sens,
+                       persist=False, background=False, log_scan=False, track=False)
+    except DataUnavailable as e:
+        raise unavailable(e)
+    return {"signal": out["signal"], "analysis": out["analysis"], "sessions": out["sessions"], "data": out["data"],
+            "open_trades": [t for t in out["open_trades"] if t["symbol"] == symbol], "updated_at": out["updated_at"]}
 
 
 # ---------------------------------------------------------------------- history

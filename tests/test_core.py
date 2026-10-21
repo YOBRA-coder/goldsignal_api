@@ -465,3 +465,11 @@ def test_history_import_mt5_csv(tmp_path, monkeypatch):
     import pytest
     with pytest.raises(hi.ImportError_):
         hi.import_text("T=X", "15m", "\n".join(rows), 3)                                       # wrong timeframe is refused
+
+
+def test_board_category_mapping():
+    from app.routers.signals_router import board_category
+    assert board_category("signal") == "signal"
+    assert board_category("waiting_trigger") == "setup" and board_category("out_of_session") == "setup"
+    assert board_category("waiting_zone") == "watch"
+    assert board_category("no_bias") == "aside" and board_category("market_closed") == "aside"

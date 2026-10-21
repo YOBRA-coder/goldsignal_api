@@ -1209,6 +1209,7 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
             "swings": [swing_json(be, s) for s in analyze_structure(be, 2, 2)["swings"][-10:]],
             "pattern": sig.get("pattern"), "mini_bos": sig.get("mini_bos"), "volume": sig.get("volume"),
             "tap_ts": sig.get("tap_ts"), "candle_ts": sig["candle_ts"],
+            "sweep": sig.get("sweep_entry"), "retest": sig.get("retest_entry"),
         },
         "levels": levels,
         "trade": {"direction": sig["direction"], "entry": sig["entry_price"], "sl": sig["stop_loss"],

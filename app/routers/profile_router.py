@@ -25,3 +25,11 @@ def me(db: Session = Depends(get_db), user: models.User = Depends(auth.get_curre
         won=won, lost=lost, breakeven=be, win_rate=round(win_rate, 2), net_r=round(net_r, 2),
         avg_agreement=round(sum(ag) / len(ag), 1) if ag else 0.0,
     )
+
+
+@router.get("/invite")
+def invite(db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
+    """Everything the 'Invite traders' card needs: the code to put in the link and how many people joined with it."""
+    joined = db.query(models.User).filter(models.User.invited_by == user.id).order_by(models.User.created_at.desc()).all()
+    return {"code": user.username, "joined": len(joined),
+            "recent": [{"name": u.name.split(" ")[0], "at": u.created_at.isoformat() + "Z"} for u in joined[:8]]}

@@ -53,3 +53,15 @@ The server keeps scanning with the browser closed (`bg_scanner.py`), so alerts k
   (out-of-sample). The best one is the highest net R per drawdown among settings that also made money in the last 30%; "Use live" applies it.
   If nothing profits it says so - that is information about the pair / timeframe / style, not a bug.
 * Settings are saved server-side (`settings.json`): `GET/PUT /engine/settings`.
+
+## v8 - Alerts board, previews, invites, manual
+
+* **Alerts page + bell**: `GET /signals/board` (what every pair is doing, from the scanner's latest evaluation), `POST /signals/board/scan`
+  (evaluate pairs now, 3 at a time from the page), `GET /signals/activity` (state changes: watch -> setup -> signal), `GET /signals/peek`
+  (read-only analysis of any pair for the pop-up chart). The scan log now stores a small `snapshot_json` (zone, plan, stage) per row.
+* **Previews**: price line with entry / stop / target, the fired candle and the outcome on signal cards, open trades and the Signals page.
+* **Full-chart pop-up** from any board row, alert, log line, signal or trade.
+* **Invites**: `users.invited_by`, `GET /profile/invite`, `?ref=<username>` on `/register`.
+* **Manual**: `/guide` (signed in) and `/manual` (public). Chart gained premium/discount + EQ, strong/weak highs & lows, FVG / sweeps / trend lines on 4H,
+  Asia / London range boxes, entry sweep, volume spike, retest entry and breakeven lines.
+* New columns are added automatically to an existing `goldsignal.db` on start.

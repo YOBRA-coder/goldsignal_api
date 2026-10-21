@@ -18,6 +18,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     confirm_password: str
+    ref: Optional[str] = None       # username of the trader who invited this person (from ?ref= in the invite link)
 
     @field_validator("confirm_password")
     @classmethod

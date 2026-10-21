@@ -20,6 +20,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     created_at = Column(DateTime, default=utcnow)
+    invited_by = Column(Integer, nullable=True)      # user id of the trader whose invite link this account used
 
     signals = relationship("SignalRecord", back_populates="owner")
     backtests = relationship("BacktestRun", back_populates="owner")
@@ -133,6 +134,9 @@ class ScanLog(Base):
     volatility_spike = Column(Boolean, nullable=True)
     checks_json = Column(Text, nullable=True)
     previews_json = Column(Text, nullable=True)
+
+    # --- added in v8 (auto-migrated): what the pair looked like (zone / watch zone / plan / price) for the Alerts board
+    snapshot_json = Column(Text, nullable=True)
 
 
 class BacktestRun(Base):

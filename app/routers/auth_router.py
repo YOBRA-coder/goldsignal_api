@@ -16,7 +16,11 @@ def register(payload: schemas.RegisterRequest, db: Session = Depends(get_db)):
     if exists:
         raise HTTPException(400, "Username or email already registered")
 
+    inviter = None
+    if payload.ref:
+        inviter = db.query(models.User).filter(models.User.username == payload.ref.strip().lstrip("@")).first()
     user = models.User(
+        invited_by=inviter.id if inviter else None,
         name=payload.name,
         username=payload.username,
         email=payload.email,
