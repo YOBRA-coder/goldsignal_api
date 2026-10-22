@@ -503,3 +503,29 @@ def test_backtest_accepts_smc_mode():
     from app.backtest import run_backtest  # noqa: F401  (signature check only; full run is covered by the demo backtest)
     import inspect
     assert "smc" in inspect.signature(run_backtest).parameters
+
+
+# ---- v10: legit-entry checks
+def test_entry_check_states():
+    from app.strategy import MAX_ENTRY_DRIFT_R, entry_check as ec
+    assert MAX_ENTRY_DRIFT_R == 0.5                       # the live engine uses the same limit the backtest always used
+    assert ec("BUY", 100, 98, 104, 100.0)["state"] == "at_entry"
+    assert ec("BUY", 100, 98, 104, 100.6)["state"] == "valid" and ec("BUY", 100, 98, 104, 100.6)["ok"]
+    assert ec("BUY", 100, 98, 104, 101.2)["state"] == "extended" and not ec("BUY", 100, 98, 104, 101.2)["ok"]
+    assert ec("BUY", 100, 98, 104, 98.9)["state"] == "against"
+    assert ec("BUY", 100, 98, 104, 97.9)["state"] == "stop_hit"
+    assert ec("BUY", 100, 98, 104, 104.5)["state"] == "target_hit"
+    assert ec("SELL", 100, 102, 96, 98.7)["state"] == "extended"
+    assert ec("SELL", 100, 102, 96, 101.2)["state"] == "against"
+    assert ec("WAIT", 1, 1, 1, 1) is None and ec("BUY", None, 1, 1, 1) is None and ec("BUY", 1, 1, 2, 1) is None
+
+
+def test_scalp_killzone_gate_only_removes_trades():
+    from app.demo_data import demo_candles
+    df = demo_candles("GC=F", "15m", 60)
+    on = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GC=F", style="scalp", max_open=3)
+    off = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GC=F", style="scalp", max_open=3, scalp_htf_killzone=False)
+    assert len(on["trades"]) <= len(off["trades"])        # a gate can only skip trades, never add them
+    sw_on = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GC=F", style="swing", max_open=3)
+    sw_off = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GC=F", style="swing", max_open=3, scalp_htf_killzone=False)
+    assert len(sw_on["trades"]) == len(sw_off["trades"])  # swing is untouched

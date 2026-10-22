@@ -377,12 +377,15 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
                                        ctx=ctx, futures=futures)
     sig["min_agreement_requested"] = min_agreement
     sig["min_agreement_effective"] = round(cfg.min_agreement, 1)
+    sig["entry_check"] = strat.entry_check(sig.get("direction"), sig.get("entry_price"), sig.get("stop_loss"), sig.get("take_profit"), price)
 
     scalp_sig = scfg = None
     if scalp:
         scfg = _make_cfg("scalp", rr, min_agreement, sessions_only, entry_interval, breakeven_at_r, sens, tuple(nwin), spread)
         scalp_sig, _ = strat.build_signal(d4, d1, de, scfg, levels, sess_mask, market_ok, ctx=ctx, futures=futures)
         scalp_sig["min_agreement_effective"] = round(scfg.min_agreement, 1)
+        scalp_sig["entry_check"] = strat.entry_check(scalp_sig.get("direction"), scalp_sig.get("entry_price"), scalp_sig.get("stop_loss"),
+                                                     scalp_sig.get("take_profit"), price)
     if not market_ok:
         lag_min = round((status.get("lag_sec") or 0) / 60)
         sig["headline"] = (f"Price feed is ~{lag_min} min behind - signals paused until it catches up"
@@ -536,8 +539,8 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
                         skipped.append(why)
                         continue
                     moved = float(cand.get("moved_r", 0.0))
-                    if not (-1.0 < moved < 1.0) and age > 0:
-                        continue                                         # it already ran away from the entry: not actionable
+                    if abs(moved) >= strat.MAX_ENTRY_DRIFT_R and age > 0:
+                        continue                                         # it already ran away from the entry: not actionable (same limit as the backtest)
                 note = ""
                 if not resolved:
                     opp = [r_ for r_ in db.query(models.SignalRecord).filter(

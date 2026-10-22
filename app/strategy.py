@@ -49,6 +49,42 @@ def _tf_scale(entry_seconds: int, bars: int) -> int:
     return max(bars, round(bars * _REF_SECONDS / entry_seconds))
 
 
+# A signal is only actionable while price is still close to its entry. The backtest has always skipped a fill that
+# ran more than half a risk unit away from the signal; the live engine used to accept up to a FULL risk unit (either
+# way), so the live app could call "late, already run away" entries valid that the backtest would never have taken.
+# One shared limit now, in R.
+MAX_ENTRY_DRIFT_R = 0.5
+
+
+def entry_check(direction: str | None, entry: float | None, sl: float | None, tp: float | None, price: float | None) -> dict | None:
+    """Is this entry still a legitimate place to get in RIGHT NOW? Compares the live price with the signal's entry in
+    units of risk. Never changes a signal, only describes it (the UI shows it next to the plan)."""
+    if direction not in ("BUY", "SELL") or None in (entry, sl, tp, price):
+        return None
+    d = 1 if direction == "BUY" else -1
+    risk = abs(entry - sl)
+    if risk <= 1e-12:
+        return None
+    moved = (price - entry) * d / risk
+    to_tp = (tp - entry) * d / risk
+    out = {"moved_r": round(moved, 2), "price": price, "entry": entry}
+    if moved <= -1.0:
+        out.update(state="stop_hit", ok=False, note="Price is already through the stop - this setup is invalid.")
+    elif moved >= to_tp:
+        out.update(state="target_hit", ok=False, note="Price already reached the target - nothing left to take.")
+    elif moved >= MAX_ENTRY_DRIFT_R:
+        out.update(state="extended", ok=False,
+                   note=f"Price has run {moved:.1f}R past the entry - do not chase. Wait for a pullback to {entry:.5g} or skip it.")
+    elif moved <= -MAX_ENTRY_DRIFT_R:
+        out.update(state="against", ok=False,
+                   note=f"Price is {abs(moved):.1f}R of the way to the stop - weaker entry. Only take it if price turns back through {entry:.5g}.")
+    elif abs(moved) <= 0.15:
+        out.update(state="at_entry", ok=True, note="Price is at the entry - the fill is clean.")
+    else:
+        out.update(state="valid", ok=True, note=f"Price is {abs(moved):.1f}R {'past' if moved > 0 else 'before'} the entry - still inside the {MAX_ENTRY_DRIFT_R:g}R limit.")
+    return out
+
+
 def effective_min_agreement(base: float, rr: float, entry_seconds: int = _REF_SECONDS) -> float:
     """Scale the required agreement with the reward you are asking for, so signal frequency tracks
     risk:reward instead of staying fixed: a 1:1 scalp target is easy to reach, so more setups qualify;
@@ -115,6 +151,7 @@ class Cfg:
     # inducement / kill-zone are scored, a climax trigger candle is refused. strict = also needs 2 of 4 quality factors and a
     # zone that is not worn out, scalps only inside a kill zone. Nothing here ever LOOSENS the existing confirmation gate.
     smc: str = "confirm"
+    scalp_htf_killzone: bool = True  # v10: a scalp that fights the 4H must fire inside a London / New York kill zone (False = old behaviour)
     max_trigger_atr: float = 3.0 # a trigger candle with a body larger than this many ATR is a climax / news bar: do not chase it
 
 
@@ -689,7 +726,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         kz = _kill_zone(t + cfg.entry_seconds)
         _add(checks, "killzone", "Inside a kill zone (London / New York open)", 4, kz is not None,
              f"{kz} kill zone - the hours the day's real move usually starts" if kz else "Quiet part of the session - fewer follow-through moves",
-             1.0, strict and scalp, tf_e)
+             1.0, bool(scalp and (strict or (against_htf and cfg.scalp_htf_killzone))), tf_e)   # v10: a scalp fighting the 4H only works when the day's real move is on
         body_atr = abs(float(be.c[i] - be.o[i])) / (a_e or 1e-9)
         _add(checks, "exhaustion", f"Trigger candle is not a climax bar (<= {cfg.max_trigger_atr:g} ATR body)", 4,
              body_atr <= cfg.max_trigger_atr if pat_ok else None,
@@ -1250,7 +1287,7 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
         if res["direction"] in ("BUY", "SELL"):
             d = 1 if res["direction"] == "BUY" else -1
             moved = (price - res["entry"]) * d / max(res["risk"], 1e-9)
-            if -1.0 < moved < 1.0:
+            if abs(moved) < MAX_ENTRY_DRIFT_R:
                 best = {**res, "age_bars": k, "moved_r": moved}
                 break
     sig = best or {**latest, "age_bars": 0, "moved_r": 0.0}
@@ -1260,6 +1297,7 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
     sig["entry_price"] = sig.pop("entry", None)
     sig["risk_reward"] = cfg.rr
     sig["reason"] = " | ".join(f"{'OK' if c['ok'] else ('n/a' if c['ok'] is None else 'NO')}: {c['detail']}" for c in sig["checks"])
+    sig["entry_check"] = entry_check(sig["direction"], sig["entry_price"], sig["stop_loss"], sig["take_profit"], price)
     sig["forming"] = forming_watch(be, forming_bar, latest, h4.trend if cfg.style != "scalp" else (h1.trend or h4.trend),
                                    cfg.entry_seconds)
     sig["server_time"] = int(time.time())
