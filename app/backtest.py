@@ -108,9 +108,17 @@ def diagnostics(trades: list[dict]) -> dict:
         "avg_bars_loss": round(sum(t.get("bars_held", 0) for t in lo) / max(1, len(lo)), 1),
         "by_agreement": ag, "by_grade": bucket(lambda t: t.get("grade")), "by_pattern": bucket(lambda t: t.get("pattern")),
         "by_zone": bucket(lambda t: t.get("zone")), "by_amd": bucket(lambda t: t.get("amd")), "by_session": bucket(lambda t: t.get("session")),
+        # v8 smart-money factors: which of them actually separate winners from losers on THIS data
+        "by_inducement": bucket(lambda t: None if not t.get("smc") else ("raided" if t["smc"]["idm"] else "not raided")),
+        "by_htf_zone": bucket(lambda t: None if not t.get("smc") else ("inside 4H zone" if t["smc"]["htf"] else "1H only")),
+        "by_breaker": bucket(lambda t: None if not t.get("smc") else ("breaker" if t["smc"]["breaker"] else "normal zone")),
+        "by_displacement": bucket(lambda t: None if not t.get("smc") else ("with FVG" if t["smc"]["disp"] else "no FVG")),
+        "by_killzone": bucket(lambda t: None if not t.get("smc") else (t["smc"]["kz"] or "outside")),
+        "by_quality": bucket(lambda t: None if not t.get("smc") else f"{t['smc']['score']} factors"),
     }
     weak = []
-    for name in ("by_agreement", "by_grade", "by_pattern", "by_zone", "by_session", "by_amd"):
+    for name in ("by_agreement", "by_grade", "by_pattern", "by_zone", "by_session", "by_amd", "by_inducement", "by_htf_zone",
+                 "by_breaker", "by_displacement", "by_killzone", "by_quality"):
         for k, b in out[name].items():
             if b["trades"] >= 8 and b["net_r"] < -2.0:
                 weak.append({"group": name[3:], "key": k, "trades": b["trades"], "win_rate": b["win_rate"], "net_r": b["net_r"]})
@@ -170,7 +178,7 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
                  df_1h: pd.DataFrame | None = None, breakeven_at_r: float = 1.0, style: str = "swing",
                  max_open: int = 1, spread: float = 0.0, slippage: float = 0.0, fill: str = "next_open",
                  collect_previews: bool = False, news_windows=(), amd_mode: str = "confirm", quality: str = "standard",
-                 daily_stop: int = 2, **cfg_extra) -> dict:
+                 daily_stop: int = 2, smc: str = "confirm", **cfg_extra) -> dict:
     """df_1h: real hourly history used to build the 1H/4H context, exactly like the live engine. Without it the
     1H/4H bars are derived from the entry candles.
     breakeven_at_r: once a trade is this many R in favor, its stop moves to entry (0 disables it).
@@ -185,7 +193,7 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
     eff_min = min_agreement_for(min_agreement, risk_reward, step, style, flags.get("sens", sens))
     cfg = Cfg(rr=risk_reward, min_agreement=eff_min, sessions_only=sessions_only, entry_seconds=step,
               entry_interval=entry_interval, breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows or ()), spread=spread, amd_mode=amd_mode, quality=quality,
-              daily_stop=daily_stop, **flags)
+              daily_stop=daily_stop, smc=smc, **flags)
     df1 = df_1h if df_1h is not None else _resample_1h(df_entry)
     df4 = resample_ohlc(df1, "4h", symbol)
     end1 = df1.index.as_unit("s").asi8 + 3600
@@ -282,6 +290,8 @@ def run_backtest(df_entry: pd.DataFrame, entry_interval: str = "15m", risk_rewar
                 "zone_tf": (res["zone"] or {}).get("tf"), "risk0": risk,
                 "reward_r": round(abs(tp - entry) / risk, 3), "be_moved": False, "style": style,
                 "trade_type": res.get("trade_type"), "amd": res.get("amd_tag"), "confirms": res.get("confirm_count"),
+                "smc": ({k: (bool(v) if k in ("fresh", "disp", "htf", "idm", "breaker") else v) for k, v in res["smc"].items() if k != "zone_touches"}
+                        if res.get("smc") else None),
                 "confirmations": res.get("confirmations"), "headline": res.get("headline")}
         if open_ts:
             ok, _why = can_open([{"direction": t["direction"], "entry": t["entry"], "sl": t["sl"]} for t in open_ts],

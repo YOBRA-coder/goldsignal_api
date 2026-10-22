@@ -142,6 +142,7 @@ class BacktestRequest(BaseModel):
     news: Optional[str] = None        # off | high | all  (None = the News setting in the app)
     amd: Optional[str] = None         # off | confirm | require (None = the Engine setting in the app)
     quality: Optional[str] = None     # standard | selective
+    smc: Optional[str] = None         # off | confirm | strict (None = the Engine setting in the app)
     daily_stop: Optional[int] = None  # stop-outs per day before the pair is paused (0 = off)
 
 

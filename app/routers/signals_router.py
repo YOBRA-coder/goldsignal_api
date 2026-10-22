@@ -217,7 +217,8 @@ def _make_cfg(style: str, rr: float, min_agreement: float, sessions_only: bool, 
                      sessions_only=sessions_only, entry_seconds=step, entry_interval=entry_interval,
                      breakeven_at_r=breakeven_at_r, style=style, news_windows=tuple(news_windows), spread=spread,
                      amd_mode=settings_mod.engine_prefs()["amd"], quality=settings_mod.engine_prefs()["quality"],
-                     daily_stop=settings_mod.engine_prefs()["daily_stop"], **strat.engine_flags(style, sens))
+                     daily_stop=settings_mod.engine_prefs()["daily_stop"], smc=settings_mod.engine_prefs()["smc"],
+                     **strat.engine_flags(style, sens))
 
 
 def _plan_json(sig: dict) -> str:
@@ -308,12 +309,13 @@ def _snapshot(sig: dict, price: float) -> dict:
             "zone_tapped": bool(sig.get("zone_ok")), "trigger_ready": bool(sig.get("pat_ok")),
             "pattern": (sig.get("pattern") or {}).get("label") if isinstance(sig.get("pattern"), dict) else sig.get("pattern"),
             "forming": fm.get("status"), "session": (sig.get("session") or {}).get("label"),
-            "amd": (sig.get("amd_now") or {}).get("phase") if isinstance(sig.get("amd_now"), dict) else None}
+            "amd": (sig.get("amd_now") or {}).get("phase") if isinstance(sig.get("amd_now"), dict) else None,
+            "smc": ({k: (bool(v) if k in ("fresh", "disp", "htf", "idm", "breaker") else v) for k, v in sig["smc"].items()} if sig.get("smc") else None)}
 
 
 # status -> board category. signal = fired; setup = zone tapped / trigger stage (something is nearly there);
 # watch = bias is clear, waiting for price to reach a zone; aside = nothing to do on this pair right now.
-_SETUP = {"waiting_trigger", "needs_confirmation", "low_agreement", "out_of_session", "risk_too_wide", "stretched",
+_SETUP = {"weak_zone", "waiting_trigger", "needs_confirmation", "low_agreement", "out_of_session", "risk_too_wide", "stretched",
           "no_room", "blocked", "amd_against", "choppy", "news"}
 
 
@@ -698,7 +700,7 @@ def replay_signals(
     for st_ in (["swing", "scalp"] if style == "both" else [style]):
         res = bt.run_backtest(sub, entry_interval, rr, min_agreement, sessions_only, symbol, df1, 1.0, style=st_,
                               max_open=3 if st_ == "swing" else 2, fill="close", collect_previews=True, sens=sens, amd_mode=settings_mod.engine_prefs()["amd"], quality=settings_mod.engine_prefs()["quality"],
-                              daily_stop=settings_mod.engine_prefs()["daily_stop"],
+                              daily_stop=settings_mod.engine_prefs()["daily_stop"], smc=settings_mod.engine_prefs()["smc"],
                               news_windows=nwin, spread=spread_)
         sig_out += [_slim_trade(t, st_) for t in res["trades"] if t["entry_ts"] >= from_ts]
         prev_out += [{**p_, "style": st_} for p_ in res.get("previews", []) if p_["ts"] >= from_ts]
@@ -835,9 +837,27 @@ def activity(
             continue
         out.append({"ts": _ts(r.ts), "symbol": r.symbol, "entry_interval": r.entry_interval, "from": before, "to": cat,
                     "status": r.status, "direction": r.direction, "agreement": r.agreement, "grade": r.grade,
-                    "headline": r.headline, "snapshot": json.loads(r.snapshot_json) if r.snapshot_json else None})
+                    "headline": r.headline, "snapshot": json.loads(r.snapshot_json) if r.snapshot_json else None,
+                    "bias_4h": r.bias_4h, "bias_1h": r.bias_1h, "id": r.id})
     out.sort(key=lambda x: -x["ts"])
     return out[:limit]
+
+
+@router.get("/activity/{log_id}")
+def activity_detail(log_id: int, db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
+    """Everything stored for one log row: the full check breakdown and every preview the engine produced."""
+    r = db.query(models.ScanLog).filter(models.ScanLog.id == log_id, models.ScanLog.user_id == user.id).first()
+    if not r:
+        raise HTTPException(404, "Log row not found")
+    def _j(x):
+        try:
+            return json.loads(x) if x else None
+        except ValueError:
+            return None
+    return {"id": r.id, "ts": _ts(r.ts), "symbol": r.symbol, "entry_interval": r.entry_interval, "status": r.status,
+            "headline": r.headline, "direction": r.direction, "agreement": r.agreement, "grade": r.grade,
+            "bias_4h": r.bias_4h, "bias_1h": r.bias_1h, "checks": _j(r.checks_json) or [],
+            "previews": _j(getattr(r, "previews_json", None)) or {}, "snapshot": _j(r.snapshot_json)}
 
 
 @router.get("/peek")

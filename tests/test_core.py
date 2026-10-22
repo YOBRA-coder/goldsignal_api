@@ -473,3 +473,33 @@ def test_board_category_mapping():
     assert board_category("waiting_trigger") == "setup" and board_category("out_of_session") == "setup"
     assert board_category("waiting_zone") == "watch"
     assert board_category("no_bias") == "aside" and board_category("market_closed") == "aside"
+
+
+def test_breaker_flips_failed_demand_block():
+    from app.structure import breaker_blocks
+    closes = [100] * 10 + [100, 99, 98, 99, 105, 112, 118, 121, 120, 121, 125, 130, 128, 131] + [124, 112, 100, 92, 90, 91, 90, 89, 90, 91]
+    b = Bars(_frame(closes, 0.3))
+    st = analyze_structure(b, 2, 2)
+    zs = zones_from_events(b, st["events"], 0.5)
+    brk = breaker_blocks(b, zs)
+    for z in brk:                                   # every breaker is a flipped, broken order block with sane geometry
+        assert z["source"] == "BRK" and z["top"] > z["bottom"] and z["type"] in ("demand", "supply")
+        assert any(o["top"] == z["top"] and o["bottom"] == z["bottom"] and o["type"] != z["type"] for o in zs)
+    assert breaker_blocks(b, []) == []
+
+
+def test_inducement_needs_a_raid_that_closed_back():
+    from app.structure import inducement
+    rng = np.random.default_rng(3)
+    c = 100 + np.cumsum(rng.normal(0, .15, 80))
+    b = Bars(_frame(list(c), 0.2))
+    r = inducement(b, b.n - 1, 1, None)
+    assert r is None or (r["wick"] < r["level"] and r["sweep_ts"] >= r["ts"])
+    r = inducement(b, b.n - 1, -1, None)
+    assert r is None or (r["wick"] > r["level"] and r["sweep_ts"] >= r["ts"])
+
+
+def test_backtest_accepts_smc_mode():
+    from app.backtest import run_backtest  # noqa: F401  (signature check only; full run is covered by the demo backtest)
+    import inspect
+    assert "smc" in inspect.signature(run_backtest).parameters

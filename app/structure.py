@@ -283,6 +283,80 @@ def find_fvgs(b: Bars, max_bars: int = 220, min_atr: float = 0.12) -> list[dict]
     return out
 
 
+# ---------------------------------------------------------------- breaker blocks
+def breaker_blocks(b: Bars, zones: list[dict], max_age: int = 260, min_body_atr: float = 0.7) -> list[dict]:
+    """Breaker blocks: an order block that FAILED. A demand zone that price closed decisively below turns into a supply
+    zone at the same prices (a 'breaker'); a supply zone that price closed decisively above turns into demand. The trapped
+    traders of the failed block are the fuel when price comes back to retest it from the other side.
+
+    Only order blocks / bases that broke with a real body (>= min_body_atr ATR beyond the edge, not just a wick-close)
+    qualify, and only recent ones. The result is a normal zone dict (source 'BRK'), tracked from the break onwards."""
+    out = []
+    for z in zones:
+        if z.get("state") != "broken" or z.get("end_idx") is None or z.get("source") not in ("OB", "BASE"):
+            continue
+        k = int(z["end_idx"])
+        if k >= b.n - 1 or k < b.n - max_age:
+            continue
+        body = abs(float(b.c[k] - b.o[k]))
+        atr = float(b.atr[k]) or 1e-9
+        if body < min_body_atr * atr:
+            continue
+        # the break must have gone the right way: demand broken DOWN (red candle), supply broken UP (green candle)
+        if z["type"] == "demand" and not b.c[k] < b.o[k]:
+            continue
+        if z["type"] == "supply" and not b.c[k] > b.o[k]:
+            continue
+        nz = {"type": "supply" if z["type"] == "demand" else "demand", "source": "BRK", "top": z["top"], "bottom": z["bottom"],
+              "idx": z["idx"], "formed_idx": k, "strength": float(z["strength"]), "event": "breaker"}
+        out.append(_track_zone(b, nz, k + 1))
+    return out
+
+
+# ------------------------------------------------------------------- inducement
+def inducement(b: Bars, i: int, d: int, tap_idx: int | None, look: int = 30, max_late: int = 6) -> dict | None:
+    """Inducement (IDM): the small internal liquidity that is raided BEFORE price reaches the real point of interest.
+
+    For a BUY (d = BULL): during the pullback towards the demand zone, minor swing lows form (stops of early buyers sit
+    under them). If price wicks BELOW one of them and closes back above it, around the time of the zone tap, the early
+    buyers have been induced / stopped out and the move can start. For a SELL it is the mirror image with minor highs.
+    A tap with no inducement taken is more often just the first step of a deeper pullback.
+
+    Looks only at bars <= i. Returns {level, ts, sweep_ts, wick, depth_atr} or None."""
+    if i < 6:
+        return None
+    anchor = i if tap_idx is None else tap_idx
+    lo = max(3, anchor - look)
+    best = None
+    for j in range(lo, i - 3):                       # 2-bar fractal: needs two confirmed bars on the right
+        if d == BULL:
+            minor = b.l[j] < min(b.l[j - 1], b.l[j - 2], b.l[j + 1], b.l[j + 2])
+            level = float(b.l[j])
+            leg = float(b.h[max(0, j - 6):j + 1].max()) - level
+        else:
+            minor = b.h[j] > max(b.h[j - 1], b.h[j - 2], b.h[j + 1], b.h[j + 2])
+            level = float(b.h[j])
+            leg = level - float(b.l[max(0, j - 6):j + 1].min())
+        if not minor or leg < 0.6 * (float(b.atr[j]) or 1e-9):     # a real internal swing, not one candle of noise
+            continue
+        for k in range(j + 3, i + 1):
+            raid = (b.l[k] < level and b.c[k] > level) if d == BULL else (b.h[k] > level and b.c[k] < level)
+            if not raid:
+                continue
+            if k < anchor - max_late or k < lo:       # taken long before the tap: no longer the trigger of this move
+                break
+            wick = float(b.l[k] if d == BULL else b.h[k])
+            depth = abs(level - wick) / (float(b.atr[k]) or 1e-9)
+            if depth < 0.1:
+                break
+            if best is None or k > best["k"]:
+                best = {"k": k, "level": level, "ts": int(b.t[j]), "sweep_ts": int(b.t[k]), "wick": wick, "depth_atr": round(depth, 2)}
+            break
+    if best:
+        best.pop("k")
+    return best
+
+
 # ------------------------------------------------------------------- liquidity
 def liquidity(b: Bars, swings: list[dict], max_swings: int = 50) -> tuple[list[dict], list[dict]]:
     """Returns (pools, sweeps).

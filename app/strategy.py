@@ -27,8 +27,8 @@ from . import news as _news
 from .amd import amd_state
 from . import sessions as _sessions
 from .indicators import ind
-from .structure import (BULL, BEAR, Bars, _pattern_from_ohlc, analyze_structure, base_zones, bias_name,
-                        candle_pattern, find_fvgs, find_swings, liquidity, merge_zones, mini_bos, num,
+from .structure import (BULL, BEAR, Bars, _pattern_from_ohlc, analyze_structure, base_zones, bias_name, breaker_blocks,
+                        candle_pattern, inducement, find_fvgs, find_swings, liquidity, merge_zones, mini_bos, num,
                         trendlines, volume_spike, zigzag, zones_from_events)
 
 MIN_BARS = {"4h": 40, "1h": 80, "entry": 60}
@@ -111,6 +111,11 @@ class Cfg:
     quality: str = "standard"    # standard | selective (1H premium/discount location + momentum are hard gates, +5 agreement)
     daily_stop: int = 2          # stop signalling a pair for the rest of the (UTC) day after this many stop-outs (0 = off)
     cooldown_bars: int = 6       # after a stop-out, no new entry in the SAME direction for this many bars (x tf scale)
+    # ---- v8: smart-money quality. off = the old rules. confirm = breaker blocks may be tapped (+1 confirmation), zone quality /
+    # inducement / kill-zone are scored, a climax trigger candle is refused. strict = also needs 2 of 4 quality factors and a
+    # zone that is not worn out, scalps only inside a kill zone. Nothing here ever LOOSENS the existing confirmation gate.
+    smc: str = "confirm"
+    max_trigger_atr: float = 3.0 # a trigger candle with a body larger than this many ATR is a climax / news bar: do not chase it
 
 
 def engine_flags(style: str = "swing", sens: str = "normal") -> dict:
@@ -142,6 +147,7 @@ class H4Ctx:
         self.st = analyze_structure(self.b, 3, 3)
         self.zones = merge_zones(zones_from_events(self.b, self.st["events"]) + base_zones(self.b))
         self.fvgs = find_fvgs(self.b, 120)
+        self.breakers = breaker_blocks(self.b, self.zones)
         self.pools, self.sweeps = liquidity(self.b, self.st["swings"])
         self.tl = trendlines(self.b, self.st["swings"])
 
@@ -158,6 +164,7 @@ class H1Ctx:
         self.st = analyze_structure(self.b, 2, 2)
         self.zones = zones_from_events(self.b, self.st["events"], min_leg_atr=1.0)
         self.fvgs = find_fvgs(self.b, 200)
+        self.breakers = breaker_blocks(self.b, self.zones)
         self.pools, self.sweeps = liquidity(self.b, self.st["swings"])
         self.tl = trendlines(self.b, self.st["swings"])
 
@@ -174,6 +181,7 @@ class TfCtx:
         self.st = analyze_structure(self.b, left, right)
         self.zones = merge_zones(zones_from_events(self.b, self.st["events"]) + base_zones(self.b))
         self.fvgs = find_fvgs(self.b, 200)
+        self.breakers = breaker_blocks(self.b, self.zones)
         self.pools, self.sweeps = liquidity(self.b, self.st["swings"])
         self.tl = trendlines(self.b, self.st["swings"])
 
@@ -246,6 +254,7 @@ def tf_json(ctx, price: float, name: str) -> dict:
         "location": None if eq is None else ("premium" if price > eq else "discount"),
         "zones": [zone_json(b, z) for z in select_zones(b, ctx.zones, price)],
         "fvgs": [zone_json(b, z) for z in select_zones(b, ctx.fvgs, price, 6, 120)],
+        "breakers": [zone_json(b, z) for z in select_zones(b, getattr(ctx, "breakers", []), price, 4, 200)],
         "pools": [pool_json(b, p) for p in sorted(ctx.pools, key=lambda p: abs(p["price"] - price))[:8]],
         "sweeps": [sweep_json(b, s) for s in ctx.sweeps[-5:]],
         "trendlines": [tl_json(b, t) for t in ctx.tl],
@@ -410,6 +419,32 @@ def _local_zones(be: Bars, i: int, want: str, span: int = 260) -> tuple[Bars, li
     return (sb, out) if out else None
 
 
+def _kill_zone(ts: int) -> str | None:
+    """London open 07-10 UTC and New York open 12-16 UTC: when the day's directional move usually starts."""
+    h = datetime.fromtimestamp(ts, timezone.utc).hour
+    return "London" if 7 <= h < 10 else "New York" if 12 <= h < 16 else None
+
+
+def smc_facts(h4: "H4Ctx", h1: "H1Ctx", be: Bars, i: int, d: int, z: dict, tap_idx: int | None, zbars: Bars, ztf: str,
+              cfg: "Cfg", t: int) -> dict:
+    """Quality of the zone that was just tapped. Every fact uses only data known at bar i."""
+    want = "demand" if d == BULL else "supply"
+    fresh = z.get("touches", 0) <= 1 and z.get("state") != "broken"
+    disp = False
+    if z["source"] == "FVG":
+        disp = True                                   # the gap itself is the displacement
+    elif ztf == "1H":
+        lo_, hi_ = z["idx"] - 1, z["formed_idx"] + 1
+        disp = any(f["type"] == want and lo_ <= f["idx"] <= hi_ for f in h1.fvgs)
+    htf = any(q["type"] == want and q["state"] != "broken" and min(q["top"], z["top"]) - max(q["bottom"], z["bottom"]) > 0
+              for q in h4.zones)
+    idm = inducement(be, i, d, tap_idx, look=_tf_scale(cfg.entry_seconds, 30), max_late=_tf_scale(cfg.entry_seconds, 6))
+    breaker = z["source"] == "BRK"
+    score = sum(bool(x) for x in (fresh, disp, htf, idm, breaker))
+    return {"fresh": fresh, "disp": disp, "htf": htf, "idm": idm, "breaker": breaker, "score": score,
+            "kz": _kill_zone(t + cfg.entry_seconds), "zone_touches": z.get("touches", 0)}
+
+
 def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bool, market_ok: bool = True,
                    levels: list | None = None, fast: bool = False) -> dict:
     """Evaluate the whole rule-set on closed entry-TF candle `i` (uses data <= i only)."""
@@ -454,7 +489,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     # ---- zone candidates on 1H (refined OB / FVG of the right type)
     cands = []
     if bias_ok:
-        for z in h1.zones + h1.fvgs:
+        for z in h1.zones + h1.fvgs + (h1.breakers if cfg.smc != "off" else []):
             if z["type"] == want and z["state"] != "broken" and z["formed_idx"] >= h1.b.n - 220 \
                     and h1.b.t[min(z["formed_idx"], h1.b.n - 1)] <= t:
                 cands.append(z)
@@ -550,7 +585,15 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
             hit = fn(be, i, d)
             if hit:
                 conf.append(hit["label"])
+    # ---- v8 smart-money facts about the tapped zone (read only once a zone is tapped; point-in-time, bars <= i)
+    smc = None
+    if cfg.smc != "off" and zone_ok:
+        smc = smc_facts(h4, h1, be, i, d, tapped, tap_idx, zbars, ztf, cfg, t)
     need = cfg.min_confirms
+    if smc is not None and smc["breaker"]:
+        need += 1                      # a breaker is a younger, less proven zone: ask for one more reason
+    if smc is not None and cfg.smc == "strict" and not smc["idm"]:
+        need += 1                      # strict: a zone tap whose inducement has not been raided is more often a half-way pullback
     if cfg.fvg_extra and tapped is not None and tapped["source"] == "FVG":
         need += 1                      # a gap-only tap is the weaker zone: ask for one more reason
     if against_htf:
@@ -628,6 +671,30 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
          (f"Volatility spike - range is {volr['ratio']:.1f}x the normal {tf_e} range, stop widened for it"
           if volr and volr["spike"] else f"Range is normal ({volr['ratio']:.1f}x baseline)" if volr
           else "Not enough bars for a volatility read"), 1.0, False, tf_e)
+
+    # ---- v8 smart-money quality checks
+    if cfg.smc != "off":
+        strict = cfg.smc == "strict"
+        if smc is not None:
+            f = [("fresh", "fresh zone (first / second touch)"), ("disp", "displacement left a fair value gap behind it"),
+                 ("htf", "sits inside a 4H zone of the same side"), ("idm", "inducement raided before the tap"),
+                 ("breaker", "breaker block (failed zone retested)")]
+            have = [txt for k, txt in f if smc[k]]
+            _add(checks, "smc_quality", "Zone quality: 2+ of fresh / displacement / 4H overlap / inducement", 3,
+                 smc["score"] >= 2, (f"{smc['score']} quality factors: " + "; ".join(have)) if have else "Plain zone - no extra quality factor",
+                 1.5, strict, "1H")
+            _add(checks, "idm", "Inducement (internal liquidity) raided before the zone", 4, bool(smc["idm"]),
+                 (f"Minor {'low' if d == BULL else 'high'} {smc['idm']['level']:.2f} swept ({smc['idm']['depth_atr']}x ATR) and closed back" if smc["idm"]
+                  else "No minor high/low raided before this tap - price may still be inducing early entries"), 1.0, False, tf_e)
+        kz = _kill_zone(t + cfg.entry_seconds)
+        _add(checks, "killzone", "Inside a kill zone (London / New York open)", 4, kz is not None,
+             f"{kz} kill zone - the hours the day's real move usually starts" if kz else "Quiet part of the session - fewer follow-through moves",
+             1.0, strict and scalp, tf_e)
+        body_atr = abs(float(be.c[i] - be.o[i])) / (a_e or 1e-9)
+        _add(checks, "exhaustion", f"Trigger candle is not a climax bar (<= {cfg.max_trigger_atr:g} ATR body)", 4,
+             body_atr <= cfg.max_trigger_atr if pat_ok else None,
+             (f"Trigger body {body_atr:.1f}x ATR" + ("" if body_atr <= cfg.max_trigger_atr else " - an exhaustion / news candle: entering after it is chasing"))
+             if pat_ok else "No trigger candle yet", 0.0, True, tf_e)
 
     # ---- risk model (needs zone + pattern)
     entry = sl = tp = risk = None
@@ -889,7 +956,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         # a mandatory gate the headline chain above does not name (anti-chase RSI, or too little backing behind the
         # trigger candle) - say THAT, not "low agreement" (the old text blamed the score even when the score was fine)
         bad = next(c for c in checks if c["gate"] and not c["ok"])
-        status = {"extension": "stretched", "confluence": "needs_confirmation", "room": "no_room", "news": "news", "cost": "blocked", "amd": "amd_against",
+        status = {"extension": "stretched", "confluence": "needs_confirmation", "room": "no_room", "news": "news", "cost": "blocked", "amd": "amd_against", "smc_quality": "weak_zone", "killzone": "blocked", "exhaustion": "stretched",
                   "chop": "choppy"}.get(bad["key"], "blocked")
         head = f"Trigger present but blocked: {bad['detail']}"
     elif not fired:
@@ -947,7 +1014,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         "h1_preview": h1_preview, "one_h_preview": one_h_preview, "entry_shift_preview": entry_shift_preview,
         "counter_watch": counter_watch, "momentum": mom, "volatility": volr, "highlights": highlights,
         "candle_ts": t, "signal_time": t + cfg.entry_seconds, "candle_idx": i,
-        "amd": amd, "amd_tag": ("aligned" if amd_aligned else "against" if amd_counter else "none"),
+        "amd": amd, "amd_tag": ("aligned" if amd_aligned else "against" if amd_counter else "none"), "smc": smc,
         "d": d, "zone_ok": zone_ok, "pat_ok": pat_ok, "zone_tf": ztf if zone_ok else None,
         "zone": {**zone_json(zbars, tapped), "tf": ztf} if tapped else None, "watch_zone": watch,
         "pattern": ({**pattern, "ts": t} if pattern else None),
@@ -1209,7 +1276,7 @@ def build_signal(df4: pd.DataFrame, df1: pd.DataFrame, df_entry: pd.DataFrame, c
             "swings": [swing_json(be, s) for s in analyze_structure(be, 2, 2)["swings"][-10:]],
             "pattern": sig.get("pattern"), "mini_bos": sig.get("mini_bos"), "volume": sig.get("volume"),
             "tap_ts": sig.get("tap_ts"), "candle_ts": sig["candle_ts"],
-            "sweep": sig.get("sweep_entry"), "retest": sig.get("retest_entry"),
+            "sweep": sig.get("sweep_entry"), "retest": sig.get("retest_entry"), "idm": (sig.get("smc") or {}).get("idm"),
         },
         "levels": levels,
         "trade": {"direction": sig["direction"], "entry": sig["entry_price"], "sl": sig["stop_loss"],

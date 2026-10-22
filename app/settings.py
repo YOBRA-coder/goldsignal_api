@@ -18,7 +18,7 @@ _lock = threading.Lock()
 _state: dict | None = None
 DEFAULTS = {"anchor": "ny_close", "offsets": {}, "offset_set_at": {},
             "news": {"filter": "high", "before": 30, "after": 20},
-            "engine": {"amd": "confirm", "quality": "standard", "daily_stop": 2}}
+            "engine": {"amd": "confirm", "quality": "standard", "daily_stop": 2, "smc": "confirm"}}
 
 
 def _load() -> dict:
@@ -97,9 +97,11 @@ def engine_prefs() -> dict:
         return {**DEFAULTS["engine"], **(_load().get("engine") or {})}
 
 
-def set_engine_prefs(amd: str | None = None, quality: str | None = None, daily_stop: int | None = None) -> dict:
+def set_engine_prefs(amd: str | None = None, quality: str | None = None, daily_stop: int | None = None, smc: str | None = None) -> dict:
     with _lock:
         cur = {**DEFAULTS["engine"], **(_load().get("engine") or {})}
+        if smc in ("off", "confirm", "strict"):
+            cur["smc"] = smc
         if amd in ("off", "confirm", "require"):
             cur["amd"] = amd
         if quality in ("standard", "selective"):

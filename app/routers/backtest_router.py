@@ -50,7 +50,8 @@ def _engine(payload) -> dict:
     ep = settings_mod.engine_prefs()
     return {"amd_mode": payload.amd if payload.amd in ("off", "confirm", "require") else ep["amd"],
             "quality": payload.quality if payload.quality in ("standard", "selective") else ep["quality"],
-            "daily_stop": payload.daily_stop if payload.daily_stop is not None else ep["daily_stop"]}
+            "daily_stop": payload.daily_stop if payload.daily_stop is not None else ep["daily_stop"],
+            "smc": getattr(payload, "smc", None) if getattr(payload, "smc", None) in ("off", "confirm", "strict") else ep["smc"]}
 
 
 def _run(payload, df, df1, nwin, eng: dict, rr=None, be=None) -> dict:
@@ -106,6 +107,11 @@ COMPARE = [
     ("safe", "Selective + AMD + daily stop", {"amd_mode": "confirm", "quality": "selective", "daily_stop": 2}),
     ("strictest", "Strictest: AMD required + selective + daily stop", {"amd_mode": "require", "quality": "selective", "daily_stop": 2}),
     # Exit models: real runs showed most trades reach +1R but few reach 2R+, and the breakeven stop then hands the gain back.
+    # v8 smart-money rules: same candles, only the SMC strictness changes
+    ("smc_off", "SMC rules off (old engine)", {"amd_mode": "confirm", "quality": "standard", "daily_stop": 2, "smc": "off"}),
+    ("smc_confirm", "SMC confirm (breakers, inducement, quality scored)", {"amd_mode": "confirm", "quality": "standard", "daily_stop": 2, "smc": "confirm"}),
+    ("smc_strict", "SMC strict (2+ quality factors, inducement, kill-zone scalps)", {"amd_mode": "confirm", "quality": "standard", "daily_stop": 2, "smc": "strict"}),
+    ("smc_best", "SMC strict + selective quality", {"amd_mode": "confirm", "quality": "selective", "daily_stop": 2, "smc": "strict"}),
     ("quick1", "Quick exit: 1R target, no breakeven", {"amd_mode": "off", "quality": "standard", "daily_stop": 2, "rr": 1.0, "be": 0}),
     ("quick15", "Quick exit: 1.5R target, no breakeven", {"amd_mode": "off", "quality": "standard", "daily_stop": 2, "rr": 1.5, "be": 0}),
     ("sel_quick1", "Selective + 1R target", {"amd_mode": "off", "quality": "selective", "daily_stop": 2, "rr": 1.0, "be": 0}),
@@ -165,6 +171,7 @@ class EngineSettings(BaseModel):
     amd: Optional[str] = None
     quality: Optional[str] = None
     daily_stop: Optional[int] = None
+    smc: Optional[str] = None
 
 
 @eng_router.get("/settings")
@@ -176,4 +183,4 @@ def get_engine(user: models.User = Depends(auth.get_current_user)):
 def put_engine(p: EngineSettings, user: models.User = Depends(auth.get_current_user)):
     from ..routers import signals_router
     signals_router._REPLAY_CACHE.clear()
-    return settings_mod.set_engine_prefs(p.amd, p.quality, p.daily_stop)
+    return settings_mod.set_engine_prefs(p.amd, p.quality, p.daily_stop, p.smc)
