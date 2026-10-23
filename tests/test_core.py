@@ -542,3 +542,17 @@ def test_v11_real_data_filters_only_remove_trades():
         assert len(new["trades"]) <= len(was["trades"]) + 2      # +2: skipping one trade can free a later one (overlap / cool-down)
         assert not any(t["pattern"] and any(w in t["pattern"] for w in ("thrust", "star", "piercing", "dark_cloud")) for t in new["trades"])
         assert not any(t.get("amd") == "aligned" for t in new["trades"])
+
+
+# ------------------------------------------------------------- news summaries + event "what next" briefing
+def test_news_prep_and_summary():
+    from app import news, news_prep
+    now = 1_800_000_000
+    ev = {"ts": now + 1800, "currency": "USD", "title": "CPI m/m", "impact": "high", "forecast": "0.3%", "previous": "0.2%", "actual": None, "source": "feed"}
+    p = news_prep.prep(ev, "XAUUSD=X", now, 30, 20)
+    assert p["phase"] == "blackout" and p["blackout"]["end"] > p["blackout"]["start"] and p["scenarios"][0]["dir"] == "down"
+    hot = news_prep.prep({**ev, "ts": now - 600, "actual": "0.5%"}, "EURUSD=X", now, 30, 20)
+    assert hot["result"]["status"] == "strong" and hot["result"]["dir"] == "down"           # USD strong -> EURUSD down
+    un = news_prep.prep({**ev, "title": "Unemployment Rate", "forecast": "4.1%", "actual": "4.4%", "ts": now - 600}, "GBPUSD=X", now, 30, 20)
+    assert un["result"]["status"] == "weak" and un["result"]["dir"] == "up"                  # inverted: higher = USD weak
+    assert news.clean_summary("<p>Gold slips &amp; yields rise.</p><p>The post X appeared first on FXStreet.</p>", "t") == "Gold slips & yields rise."

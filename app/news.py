@@ -247,6 +247,27 @@ def hit(wins: tuple | list, ts: int):
 
 
 # ---------------------------------------------------------------------------------------------------- headlines
+_TAG = re.compile(r"<[^>]+>")
+_BOILER = re.compile(r"(the post .{0,200}? appeared first on .*$|\bappeared first on\b.*$|read more.*$|continue reading.*$|\[…\]|\[\.\.\.\])", re.I | re.S)
+
+
+def clean_summary(raw: str | None, title: str = "", max_chars: int = 420) -> str:
+    """RSS description/content -> a short plain-text summary (whole sentences, no HTML, no 'appeared first on')."""
+    import html
+    if not raw:
+        return ""
+    t = html.unescape(_TAG.sub(" ", raw))
+    t = _BOILER.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t or t.lower().rstrip(".") == title.lower().rstrip("."):
+        return ""
+    if len(t) <= max_chars:
+        return t
+    cut = t[:max_chars]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    return cut[:end + 1] if end > max_chars * 0.4 else cut.rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
+
 def headlines(symbol: str | None = None, limit: int = 20) -> list[dict]:
     now = time.time()
     with _lock:
@@ -268,8 +289,9 @@ def headlines(symbol: str | None = None, limit: int = 20) -> list[dict]:
                         ts = int(parsedate_to_datetime(it.findtext("pubDate")).timestamp())
                     except Exception:  # noqa: BLE001
                         ts = int(now)
+                    full = it.findtext("{http://purl.org/rss/1.0/modules/content/}encoded") or it.findtext("description")
                     items.append({"ts": ts, "title": title, "link": (it.findtext("link") or "").strip(), "source": name,
-                                  "major": bool(MAJOR.search(title))})
+                                  "major": bool(MAJOR.search(title)), "summary": clean_summary(full, title)})
             except Exception as e:  # noqa: BLE001
                 log.warning("headlines %s failed: %s", name, e)
         items.sort(key=lambda x: -x["ts"])

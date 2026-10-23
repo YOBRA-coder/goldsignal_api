@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .. import auth, models, news, settings
+from .. import auth, models, news, news_prep, settings
 from ..data_fetcher import DataUnavailable, drop_incomplete, get_candles
 from ..database import get_db
 
@@ -58,6 +58,7 @@ def calendar(symbol: str = "GC=F", days_back: int = Query(2, ge=0, le=365), days
                "major": bool(news.MAJOR.search(e["title"]))}
         if df is not None and e["ts"] < now - 300 and e["currency"] in cur:
             row["reaction"] = _reaction(df, e["ts"], atr5)
+        row["prep"] = news_prep.prep(e, symbol, now)
         out.append(row)
     return {"symbol": symbol, "events": out, "now": now, "status": news.status(), "settings": settings.news_prefs()}
 
