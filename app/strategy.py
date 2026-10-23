@@ -54,6 +54,7 @@ def _tf_scale(entry_seconds: int, bars: int) -> int:
 # way), so the live app could call "late, already run away" entries valid that the backtest would never have taken.
 # One shared limit now, in R.
 MAX_ENTRY_DRIFT_R = 0.5
+WEAK_FAMILIES = {"thrust", "star", "piercing"}     # trigger-candle families that lost money on real candles (see Cfg.weak_patterns)
 
 
 def entry_check(direction: str | None, entry: float | None, sl: float | None, tp: float | None, price: float | None) -> dict | None:
@@ -151,6 +152,11 @@ class Cfg:
     # inducement / kill-zone are scored, a climax trigger candle is refused. strict = also needs 2 of 4 quality factors and a
     # zone that is not worn out, scalps only inside a kill zone. Nothing here ever LOOSENS the existing confirmation gate.
     smc: str = "confirm"
+    # v11 (measured on 927 real trades, see README): two things the old rules counted as GOOD that lost money on real candles.
+    amd_counts: bool = False         # an aligned AMD raid used to count as a confirmation (and add agreement): those trades lost ~0.4R each. False = informational only
+    amd_block_aligned: bool = True   # an entry taken AFTER the AMD raid has already turned into distribution is a chase: on real candles those trades lost ~0.4R each (-0.47 swing, -0.41 scalp) in every slice
+    scalp_with_htf_only: bool = True   # a scalp that fights the 4H lost -0.32R per trade on real candles (68 trades, vs -0.13R with the 4H); False = old behaviour
+    weak_patterns: bool = False      # thrust / star / piercing-dark-cloud triggers lost ~0.5R each on every pair and half-year. False = not trigger candles
     scalp_htf_killzone: bool = True  # v10: a scalp that fights the 4H must fire inside a London / New York kill zone (False = old behaviour)
     max_trigger_atr: float = 3.0 # a trigger candle with a body larger than this many ATR is a climax / news bar: do not chase it
 
@@ -504,7 +510,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     sign = "bullish" if d == BULL else "bearish"
 
     # ---- STEP 1: 4H direction
-    bias_ok = d != 0
+    bias_ok = d != 0 and not (against_htf and cfg.scalp_with_htf_only)
     if scalp:
         _add(checks, "bias_4h", "1H (or 4H) gives the scalp a direction", 1, bias_ok,
              ((f"1H is {bias1.upper()}, 4H is {bias4.upper()} - " + ("with the bigger trend" if not against_htf
@@ -562,6 +568,8 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
     if bias_ok:
         pats = cf.candle_patterns(be, i, d) if cfg.ext_patterns else \
             ([p0] if (p0 := candle_pattern(be, i, d)) else [])
+    if pats and not cfg.weak_patterns:
+        pats = [q for q in pats if q.get("family") not in WEAK_FAMILIES]
     pattern = pats[0] if pats else None
     pat_ok = pattern is not None and zone_ok
     _add(checks, "candle", f"{tf_e} confirmation candle at the zone" if cfg.ext_patterns
@@ -643,7 +651,7 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
         live_ph = amd["phase"] in ("manipulation", "distribution")
         amd_aligned = bool(live_ph and amd["dir"] == d)
         amd_counter = bool(live_ph and amd["dir"] == -d)
-        if amd_aligned:
+        if amd_aligned and cfg.amd_counts:
             conf.append(f"AMD: {amd['sweep']['side']} of the range raided, now {amd['phase']}")
         elif amd_counter:
             need += 1                  # the range's trap points the OTHER way: ask for one more reason
@@ -692,12 +700,14 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
 
     if cfg.amd_mode != "off":
         if amd is not None:
+            blocked = bool(amd_aligned and cfg.amd_block_aligned)
             _add(checks, "amd", "AMD: accumulation -> manipulation -> distribution agrees", 4,
-                 True if amd_aligned else (False if amd_counter else None),
-                 (f"{amd['note']} - same direction as this trade" if amd_aligned else
+                 False if blocked else (True if amd_aligned else (False if amd_counter else None)),
+                 (f"{amd['note']} - the raid already turned into distribution: entering now chases the move (these lost money on real candles)" if blocked else
+                  f"{amd['note']} - same direction as this trade" if amd_aligned else
                   f"{amd['note']} - but it points the OTHER way" if amd_counter else
                   amd.get("note") or "No fresh range-raid-displacement sequence on this timeframe"),
-                 1.5 if amd_aligned else 0.5, cfg.amd_mode == "require", tf_e)
+                 1.5 if (amd_aligned and cfg.amd_counts and not blocked) else 0.5, (cfg.amd_mode == "require") or blocked, tf_e)
         elif cfg.amd_mode == "require":
             _add(checks, "amd", "AMD: accumulation -> manipulation -> distribution agrees", 4, None,
                  "Pending trigger candle", 0.0, True, tf_e)

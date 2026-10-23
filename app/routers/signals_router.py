@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from .. import auth, models, schemas, sessions, trades
+from .. import auth, brain as brain_mod, models, schemas, sessions, trades
 from .. import news as news_mod
 from .. import settings as settings_mod
 from .. import strategy as strat
@@ -332,8 +332,9 @@ def board_category(status: str | None) -> str:
 def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interval: str = "15m",
              min_agreement: float = 70, sessions_only: bool = True, rr: float = 2.0, breakeven_at_r: float = 1.0,
              scalp: bool = False, sens: str = "normal", persist: bool = True, background: bool = False,
-             log_scan: bool = True, track: bool = True) -> dict:
+             log_scan: bool = True, track: bool = True, with_brain: bool = False) -> dict:
     """One full evaluation of a pair. Called by the page (/signals/live) and by the background scanner.
+    with_brain adds sig["brain"] (readiness %, approval, quick shifts, pattern memory - read-only, see brain.py).
     Raises DataUnavailable when the feed is down."""
     raw4 = get_candles(symbol, "4h")
     raw1 = get_candles(symbol, "1h")
@@ -419,6 +420,12 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
         sig["headline"] = f"NEWS BLACKOUT - {cur_w[2]}: signals paused. " + str(sig.get("headline") or "")
     sess = sessions.session_state(futures=futures)
     sig["session"] = {"label": sess["label"], "active": sess["active"], "allowed": sess["trade_allowed"]}
+    if with_brain:
+        try:
+            sig["brain"] = brain_mod.build_brain(db, user, symbol, sig, scalp_sig, ctx, de, cfg, price, levels, futures, forming_bar, sig["session"])
+        except Exception:  # noqa: BLE001 - the brain is advisory; it must never take the live signal down
+            log.exception("brain failed")
+            sig["brain"] = None
 
     # ---- early-warning: did the 4H/1H bias itself shift? (independent of whether a full signal fired)
     if market_ok and persist:
@@ -615,7 +622,8 @@ def live_signal(
     user: models.User = Depends(auth.get_current_user),
 ):
     try:
-        return run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, breakeven_at_r, scalp, sens, persist)
+        return run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, breakeven_at_r, scalp, sens, persist,
+                        with_brain=True)
     except DataUnavailable as e:
         raise unavailable(e)
 
@@ -636,7 +644,7 @@ def brief(
     pop-up). Same engine as /live but it records nothing: no scan-log row, no signal, no alert, no trade tracking."""
     try:
         out = run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, 1.0, scalp, sens,
-                       persist=False, log_scan=False, track=False)
+                       persist=False, log_scan=False, track=False, with_brain=True)
     except DataUnavailable as e:
         raise unavailable(e)
     rows = db.query(models.ScanLog).filter(
@@ -877,7 +885,7 @@ def peek(
     """Read-only analysis of ANY pair for the pop-up chart: nothing is saved, no alerts, no trade tracking."""
     try:
         out = run_scan(db, user, symbol, entry_interval, min_agreement, sessions_only, rr, 1.0, False, sens,
-                       persist=False, background=False, log_scan=False, track=False)
+                       persist=False, background=False, log_scan=False, track=False, with_brain=True)
     except DataUnavailable as e:
         raise unavailable(e)
     return {"signal": out["signal"], "analysis": out["analysis"], "sessions": out["sessions"], "data": out["data"],

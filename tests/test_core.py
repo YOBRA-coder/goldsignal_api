@@ -529,3 +529,16 @@ def test_scalp_killzone_gate_only_removes_trades():
     sw_on = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GC=F", style="swing", max_open=3)
     sw_off = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GC=F", style="swing", max_open=3, scalp_htf_killzone=False)
     assert len(sw_on["trades"]) == len(sw_off["trades"])  # swing is untouched
+
+
+def test_v11_real_data_filters_only_remove_trades():
+    """The three v11 switches were derived from real candles; each can only skip trades, and the old behaviour is one flag away."""
+    from app.demo_data import demo_candles
+    df = demo_candles("GBPUSD=X", "15m", 60)
+    old = dict(amd_counts=True, weak_patterns=True, amd_block_aligned=False, scalp_with_htf_only=False)
+    for style in ("swing", "scalp"):
+        new = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GBPUSD=X", style=style, max_open=3)
+        was = bt.run_backtest(df, "15m", 2.0, 70.0, True, "GBPUSD=X", style=style, max_open=3, **old)
+        assert len(new["trades"]) <= len(was["trades"]) + 2      # +2: skipping one trade can free a later one (overlap / cool-down)
+        assert not any(t["pattern"] and any(w in t["pattern"] for w in ("thrust", "star", "piercing", "dark_cloud")) for t in new["trades"])
+        assert not any(t.get("amd") == "aligned" for t in new["trades"])
