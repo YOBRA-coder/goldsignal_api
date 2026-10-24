@@ -210,7 +210,8 @@ def window_for(e: dict, before: int, after: int, level: str) -> tuple[int, int] 
 
 def windows(db: Session, symbol: str, from_ts: int, to_ts: int, level: str | None = None,
             before: int | None = None, after: int | None = None) -> list[tuple]:
-    """Merged blackout windows [(start, end, label, impact)] for the engine. Looks 1 day beyond the span on both sides."""
+    """Merged blackout windows [(start, end, label, impact, release_ts)] for the engine. Looks 1 day beyond the span on both sides.
+    release_ts (5th item, may be missing in hand-made windows) is when the number came out - post_read() measures the reaction from it."""
     pr = settings.news_prefs()
     level = level or pr["filter"]
     if level == "off":
@@ -222,16 +223,17 @@ def windows(db: Session, symbol: str, from_ts: int, to_ts: int, level: str | Non
     for e in ev:
         w = window_for(e, before, after, level)
         if w:
-            out.append((w[0], w[1], f"{e['currency']} {e['title']}", e["impact"]))
+            out.append((w[0], w[1], f"{e['currency']} {e['title']}", e["impact"], e["ts"]))
     out.sort()
     merged: list[list] = []
-    for s, t, lab, imp in out:
+    for s, t, lab, imp, rel in out:
         if merged and s <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], t)
+            merged[-1][4] = max(merged[-1][4], rel)         # the latest print is the one price is reacting to now
             if lab not in merged[-1][2]:
                 merged[-1][2] += f" + {lab}"
         else:
-            merged.append([s, t, lab, imp])
+            merged.append([s, t, lab, imp, rel])
     return [tuple(m) for m in merged]
 
 
@@ -244,6 +246,52 @@ def hit(wins: tuple | list, ts: int):
     cur = wins[k] if k >= 0 and wins[k][1] >= ts else None
     nxt = wins[k + 1] if k + 1 < len(wins) else None
     return cur, nxt
+
+
+# ------------------------------------------------------------------------------------------- after the release
+def post_read(wins, be, i: int, step: int, max_min: int = 150, min_atr: float = 0.8) -> dict | None:
+    """What price has done since the most recent release whose blackout is over - so news HELPS entries after it prints
+    instead of only blocking them before. Pure numpy on the entry-timeframe bars (`be`: .t .o .h .l .c .atr), so the live
+    engine, the brain and backtests all read the same thing, using bars <= i only.
+
+    Returns None when there is no finished release in the last `max_min` minutes (or windows carry no release time).
+    dir = +1 / -1 when price has travelled >= `min_atr` ATR from the pre-release close, else 0 (flat or faded back).
+    state: 'settling' (< 3 bars since the print - spike still resolving), 'directional', 'flat'.
+    retest: price pulled back 25-80 % of the spike and is holding the right side of its midpoint = the classic post-news entry."""
+    if not wins:
+        return None
+    now = int(be.t[i]) + step
+    cand = [w for w in wins if len(w) > 4 and w[4] and w[1] <= now and 0 <= now - w[4] <= max_min * 60]
+    if not cand:
+        return None
+    w = max(cand, key=lambda x: x[4])
+    rel = int(w[4])
+    k = int(bisect.bisect_left([int(x) for x in be.t[max(0, i - 400):i + 1]], rel)) + max(0, i - 400)
+    if k < 1 or k > i:
+        return None
+    atr = float(be.atr[i]) or 0.0
+    if atr <= 0:
+        return None
+    base = float(be.c[k - 1])
+    seg_h, seg_l = be.h[k:i + 1], be.l[k:i + 1]
+    hi, lo = float(seg_h.max()), float(seg_l.min())
+    move = float(be.c[i]) - base
+    m_atr = move / atr
+    d = 1 if m_atr >= min_atr else -1 if m_atr <= -min_atr else 0
+    bars = i - k + 1
+    retest, pull = False, None
+    if d != 0:
+        ext = (hi - base) if d == 1 else (base - lo)
+        if ext > 0:
+            j = k + int(seg_h.argmax()) if d == 1 else k + int(seg_l.argmin())
+            tail_ = be.l[j:i + 1] if d == 1 else be.h[j:i + 1]
+            back = (hi - float(tail_.min())) if d == 1 else (float(tail_.max()) - lo)
+            pull = round(back / ext, 2)
+            mid = base + d * 0.5 * ext
+            retest = bool(0.25 <= pull <= 0.8 and (float(be.c[i]) - mid) * d > 0)
+    return {"label": w[2], "release_ts": rel, "mins_ago": int((now - rel) // 60), "base": round(base, 5), "hi": round(hi, 5),
+            "lo": round(lo, 5), "move_atr": round(m_atr, 2), "range_atr": round((hi - lo) / atr, 1), "dir": d, "bars": bars,
+            "pullback": pull, "retest": retest, "state": "settling" if bars < 3 else ("directional" if d else "flat")}
 
 
 # ---------------------------------------------------------------------------------------------------- headlines

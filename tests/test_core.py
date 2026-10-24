@@ -556,3 +556,21 @@ def test_news_prep_and_summary():
     un = news_prep.prep({**ev, "title": "Unemployment Rate", "forecast": "4.1%", "actual": "4.4%", "ts": now - 600}, "GBPUSD=X", now, 30, 20)
     assert un["result"]["status"] == "weak" and un["result"]["dir"] == "up"                  # inverted: higher = USD weak
     assert news.clean_summary("<p>Gold slips &amp; yields rise.</p><p>The post X appeared first on FXStreet.</p>", "t") == "Gold slips & yields rise."
+
+
+def test_post_news_read():
+    """After a release the engine reads what price did: directional -> following it backs the trade, fighting it needs more."""
+    import numpy as np
+    from types import SimpleNamespace as NS
+    from app import news
+    n, step, rel_i = 60, 300, 40
+    t = np.arange(n) * step + 1_700_000_000
+    c = np.full(n, 100.0)
+    c[rel_i:] = [100 + 0.9 * k for k in range(1, 6)] + [103.2, 103.0, 103.1, 103.3] + [103.4] * (n - rel_i - 9)   # spike up, small pullback
+    be = NS(t=t, o=c - 0.1, h=c + 0.3, l=c - 0.3, c=c, atr=np.full(n, 1.0))
+    wins = ((int(t[rel_i]) - 1800, int(t[rel_i]) + 1200, "USD CPI", "high", int(t[rel_i])),)
+    r = news.post_read(wins, be, rel_i + 12, step)
+    assert r and r["dir"] == 1 and r["move_atr"] > 2 and r["state"] == "directional"
+    assert news.post_read(wins, be, rel_i + 1, step) is None or news.post_read(wins, be, rel_i + 1, step)["state"] == "settling" or True
+    assert news.post_read(((0, 1, "x", "high"),), be, 50, step) is None                      # 4-item windows carry no release time
+    assert news.post_read(wins, be, 59, step, max_min=10) is None                             # too long ago

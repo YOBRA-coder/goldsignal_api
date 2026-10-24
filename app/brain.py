@@ -204,11 +204,12 @@ def _track(db, user, symbol: str, direction: str, days: int = 90) -> dict:
 
 
 # ------------------------------------------------------------------------------------------ fundamentals
-def _fundamentals(db, symbol: str, news: dict | None, now: int) -> dict:
+def _fundamentals(db, symbol: str, news: dict | None, now: int, reaction: dict | None = None) -> dict:
     ev_out: list[dict] = []
     try:
-        evs = news_mod.events_between(db, symbol, now - 3600, now + 12 * 3600, "medium")
-        for e in evs[:12]:
+        evs = news_mod.events_between(db, symbol, now - 8 * 3600, now + 48 * 3600, "medium")
+        evs = [e for e in evs if e["ts"] >= now - 3600 or e["impact"] == "high"][:24]
+        for e in evs:
             ev_out.append({"ts": e["ts"], "title": e["title"], "currency": e["currency"], "impact": e["impact"],
                            "minutes": round((e["ts"] - now) / 60), "forecast": e.get("forecast"),
                            "previous": e.get("previous"), "actual": e.get("actual")})
@@ -229,7 +230,34 @@ def _fundamentals(db, symbol: str, news: dict | None, now: int) -> dict:
     elif just:
         e = just[-1]
         score, note = 0.6, f"{e['currency']} {e['title']} printed {abs(e['minutes'])} min ago - candles can still be erratic"
-    return {"score": score, "note": note, "events": ev_out, "blackout": blackout, "next": (news or {}).get("next")}
+    if reaction:
+        # what the release actually did to price + what the printed number implies for this pair (news_prep)
+        try:
+            from . import news_prep
+            hit_ = min(evs, key=lambda e: abs(e["ts"] - reaction["release_ts"]), default=None)
+            if hit_ and abs(hit_["ts"] - reaction["release_ts"]) <= 600:
+                pr = news_prep.prep(hit_, symbol, now)
+                reaction = {**reaction, "title": hit_["title"], "actual": hit_.get("actual"), "forecast": hit_.get("forecast"),
+                            "read": (pr.get("result") or {}).get("text")}
+        except Exception:  # noqa: BLE001 - advisory
+            pass
+    return {"score": score, "note": note, "events": ev_out, "blackout": blackout, "next": (news or {}).get("next"), "reaction": reaction,
+            "upcoming": bool(upcoming)}
+
+
+def _news_for_side(fund: dict, dd: int) -> tuple[float, str]:
+    """Per-side read of the news stage: before / during a release it is the gate, afterwards the printed move can back one side."""
+    r = fund.get("reaction")
+    if fund.get("blackout") or fund.get("upcoming") or not r or r["state"] == "settling":
+        if r and r["state"] == "settling" and not fund.get("blackout"):
+            return 0.6, f"{r['label']} printed {r['mins_ago']} min ago - spike still settling, wait for 3 closed candles"
+        return fund["score"], fund["note"]
+    mv = f"{r['label']} moved price {r['move_atr']:+.1f} ATR in {r['mins_ago']} min"
+    if r["dir"] == dd:
+        return 1.0, f"{mv} - this side follows it" + (" (pulled back and holding: post-news retest)" if r["retest"] else "")
+    if r["dir"] == -dd:
+        return 0.4, f"{mv} - this side FIGHTS it; needs the move to fail first"
+    return 1.0, f"{r['label']} printed {r['mins_ago']} min ago - no clear direction, price went {r['move_atr']:+.1f} ATR"
 
 
 # ------------------------------------------------------------------------------------------ confirmations
@@ -263,6 +291,13 @@ def _confirm_items(be: Bars, i: int, d: int, cfg, h1) -> list[dict]:
         except Exception:  # noqa: BLE001
             hit = None
         items.append({"key": key, "label": label, "ok": hit is not None, "detail": hit["label"] if hit else none_txt})
+    try:
+        pn = news_mod.post_read(cfg.news_windows, be, i, cfg.entry_seconds) if (getattr(cfg, "postnews", True) and cfg.news_windows) else None
+    except Exception:  # noqa: BLE001
+        pn = None
+    if pn and pn["state"] != "settling":
+        items.append({"key": "postnews", "label": "Post-news move", "ok": pn["dir"] == d,
+                      "detail": (f"{pn['label']} moved price {pn['move_atr']:+.1f} ATR - " + ("entry follows it" if pn["dir"] == d else "no clear direction" if pn["dir"] == 0 else "entry fights it (+1 confirmation needed)"))})
     return items
 
 
@@ -283,7 +318,11 @@ def build_brain(db, user, symbol: str, sig: dict, scalp_sig: dict | None, ctx: t
     sess_ok = bool(outlook.get("session_open_now")) if outlook else bool((sess or {}).get("allowed"))
     kill = strat._kill_zone(now)
     news_info = sig.get("news") or {}
-    fund = _fundamentals(db, symbol, news_info, now)
+    try:
+        reaction = news_mod.post_read(cfg.news_windows, be, i, step) if getattr(cfg, "postnews", True) else None
+    except Exception:  # noqa: BLE001 - advisory
+        reaction = None
+    fund = _fundamentals(db, symbol, news_info, now, reaction)
     e = ind(be)
 
     # ---- memory tables (cached per last bar) from the stored candles
@@ -335,6 +374,8 @@ def build_brain(db, user, symbol: str, sig: dict, scalp_sig: dict | None, ctx: t
         need = int(sig.get("confirm_needed") or cfg.min_confirms) if (sig.get("d") == dd and sig.get("confirm_needed")) else cfg.min_confirms
         if counter:
             need += 1                       # the engine asks one more reason for anything that fights the 4H
+        if reaction and reaction["state"] != "settling" and reaction["dir"] == -dd and not (sig.get("d") == dd and sig.get("confirm_needed")):
+            need += 1                       # fights the post-news move (the live signal already counted this when it is the evaluated side)
 
         # ---- gates
         ex = cf.extension(be, i, dd)
@@ -378,8 +419,7 @@ def build_brain(db, user, symbol: str, sig: dict, scalp_sig: dict | None, ctx: t
                   + ("" if s_candle >= 0.6 else " - they only count once a trigger candle shows"))
         s_sess = 1.0 if sess_ok else 0.0
         d_sess = (f"{(kill or 'London / New York')} session open" if sess_ok else "outside London / New York")
-        s_news = fund["score"]
-        d_news = fund["note"]
+        s_news, d_news = _news_for_side(fund, dd)
         s_room = 1.0 if room_ok and chase_ok else (0.5 if room_ok or chase_ok else 0.0)
         d_room = ((f"{rwd:.1f}R to the next wall" if rwd is not None else "path looks clear")
                   + ("" if chase_ok else f" - but RSI says the move is stretched ({ex['rsi']:.0f})")
@@ -517,7 +557,7 @@ def build_brain(db, user, symbol: str, sig: dict, scalp_sig: dict | None, ctx: t
         ("candle", "Trigger candle closed at the zone", st["candle"]["state"] == "done"),
         ("confirm", f"At least {L['confirm']['need'] + 1} confirmations (one more than the minimum)", L["confirm"]["have"] >= L["confirm"]["need"] + 1),
         ("timing", "Inside a London / New York kill zone", bool(kill) and sess_ok),
-        ("news", "No news blackout or high-impact release within the hour", fund["score"] >= 0.65 and fund["blackout"] is None),
+        ("news", "No news blackout, and no high-impact release about to hit", st["news"]["score"] >= 0.65 and fund["blackout"] is None),
         ("room", "Room to the next wall and not chasing", st["room"]["state"] == "done"),
         ("entry", "Entry is still valid (price has not run away)", ec.get("ok", True) if ec else L["state"] in ("ready", "fire")),
         ("memory", "Pattern memory is not negative", mem_ok),
@@ -561,10 +601,18 @@ def build_brain(db, user, symbol: str, sig: dict, scalp_sig: dict | None, ctx: t
             p_ = _patterns(be, j, dd, cfg)
             if p_:
                 recent.append({"ts": int(be.t[j]), "dir": _side(dd), "label": p_[0]["label"], "family": p_[0].get("family"), "strength": p_[0].get("strength", 1)})
-    tail = min(be.n, 60)
+    tail = min(be.n, 120)
     candles = [[int(be.t[k]), float(be.o[k]), float(be.h[k]), float(be.l[k]), float(be.c[k])] for k in range(be.n - tail, be.n)]
 
+    try:
+        marks = [{"ts": e["ts"], "title": e["title"], "currency": e["currency"], "impact": e["impact"],
+                  "actual": e.get("actual"), "forecast": e.get("forecast")}
+                 for e in news_mod.events_between(db, symbol, candles[0][0], now + 12 * 3600, "medium")][:30]
+    except Exception:  # noqa: BLE001
+        marks = []
+
     return clean({
+        "news_marks": marks,
         "ts": now, "symbol": symbol, "tf": cfg.entry_interval, "step": step, "price": price, "atr": a_e,
         "sigma_bar": outlook.get("sigma_bar"), "sides": sides, "lead": lead, "lean": {"side": lean, "buy_pct": lean_pct, "sell_pct": 100 - lean_pct,
                                                                                         "buy_score": b_s, "sell_score": s_s},

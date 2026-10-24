@@ -141,7 +141,8 @@ class Cfg:
     # 1.0-1.4R away: one stop-out (-1R, plus spread) ate two or three of those small wins.
     min_room_r: float = 1.5      # the next real wall must be at least this many R away (scaled down for short rr)
     chop_min: float = 0.07       # entry-TF efficiency ratio over 40 bars below this = pure chop, no entries
-    news_windows: tuple = ()     # ((start_ts, end_ts, label, impact), ...) high-impact news blackout, see news.py
+    news_windows: tuple = ()     # ((start_ts, end_ts, label, impact, release_ts), ...) high-impact news blackout, see news.py
+    postnews: bool = True        # after a release: an entry that follows its move counts as a confirmation, one that fights it needs one more
     spread: float = 0.0          # price units; with max_cost_r it rejects trades where the spread alone eats too much of the risk
     max_cost_r: float = 0.15
     amd_mode: str = "confirm"    # off | confirm (AMD adds a confirmation / a counter-AMD trigger needs one more) | require (must be aligned)
@@ -655,6 +656,15 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
             conf.append(f"AMD: {amd['sweep']['side']} of the range raided, now {amd['phase']}")
         elif amd_counter:
             need += 1                  # the range's trap points the OTHER way: ask for one more reason
+    # ---- after the release: news is information once the blackout is over. Following the move it started is a reason to
+    # take the trade (a break + retest of the news spike is the classic entry); fighting it asks for one more reason.
+    pn = _news.post_read(cfg.news_windows, be, i, cfg.entry_seconds) if (cfg.postnews and cfg.news_windows) else None
+    pn_aligned = bool(pn and pn["dir"] == d and pn["state"] != "settling")
+    pn_counter = bool(pn and pn["dir"] == -d and pn["state"] != "settling")
+    if pat_ok and pn_aligned:
+        conf.append(f"Post-news: {pn['label']} moved price {pn['move_atr']:+.1f} ATR" + (", pulled back and holding" if pn["retest"] else "") + " - entry follows it")
+    elif pn_counter:
+        need += 1                      # fighting the post-news move: ask for one more reason
     confluence_ok = bool(pat_ok and len(conf) >= need)
     _add(checks, "confluence", (f"At least {need} independent confirmation{'s' if need > 1 else ''} behind the trigger candle"
                                 if cfg.ext_confirms or need > 1 else
@@ -678,6 +688,14 @@ def evaluate_entry(h4: H4Ctx, h1: H1Ctx, be: Bars, i: int, cfg: Cfg, sess_ok: bo
              (f"Blackout: {nw[2]} ({'ends' if nw[1] > t else 'ended'} {datetime.fromtimestamp(nw[1], timezone.utc):%H:%M} UTC)" if nw else
               (f"Next: {nn[2]} at {datetime.fromtimestamp(nn[0], timezone.utc):%a %H:%M} UTC (blackout starts)" if nn else "No news blackout ahead")),
              0.0, True, tf_e)
+
+    if pn is not None:
+        _add(checks, "postnews", "Entry agrees with the post-news move", 4,
+             True if pn_aligned else False if pn_counter else None,
+             (f"{pn['label']} printed {pn['mins_ago']} min ago, price {pn['move_atr']:+.1f} ATR since" + (" (pulled back and holding)" if pn["retest"] else "")
+              + (" - this entry follows it" if pn_aligned else " - this entry FIGHTS it: wait for the move to fail (structure break) first" if pn_counter
+                 else " - no clear direction yet" if pn["state"] != "settling" else " - spike still settling, wait for 3 closed candles")),
+             1.0, False, tf_e)
 
     # ---- chop: no direction at all over the last 40 bars (price went nowhere while travelling a lot)
     if i >= 40:
